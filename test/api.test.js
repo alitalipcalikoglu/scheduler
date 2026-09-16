@@ -75,14 +75,18 @@ test('API: manual runs, run listing, cancel, and the worker end to end', async (
   t.after(() => app.close());
   await app.inject({ method: 'POST', url: '/v1/jobs', headers: bearer(RW_KEY), payload: { name: 'ok', schedule: { cron: '@daily' }, target: { url: `${target.url}/ok` } } });
   await app.inject({ method: 'POST', url: '/v1/jobs', headers: bearer(RW_KEY), payload: { name: 'bad', schedule: { cron: '@daily' }, target: { url: `${target.url}/fail` }, retry: { max: 3, backoffSec: 60 } } });
-  let res = await app.inject({ method: 'POST', url: '/v1/jobs/ok/run', headers: bearer(WRITE_KEY) });
-  assert.equal(res.statusCode, 202, res.body);
+  let res = await app.inject({ method: 'POST', url: '/v1/jobs/ok/run', headers: { ...bearer(WRITE_KEY), 'content-type': 'application/json' } });
+  assert.equal(res.statusCode, 202, `empty JSON body accepted: ${res.body}`);
   const okRun = json(res).run;
   assert.deepEqual([okRun.job, okRun.trigger, okRun.status, okRun.attempt, okRun.maxAttempts], ['ok', 'manual', 'pending', 0, 4]);
   res = await app.inject({ method: 'POST', url: '/v1/jobs/ok/run', headers: bearer(WRITE_KEY) });
   assert.equal(res.statusCode, 409);
   assert.equal(json(res).error.code, 'RUN_ACTIVE');
   assert.equal((await app.inject({ method: 'POST', url: '/v1/jobs/ok/run', headers: bearer(READ_KEY) })).statusCode, 403);
+  res = await app.inject({ method: 'POST', url: '/v1/jobs', headers: { ...bearer(WRITE_KEY), 'content-type': 'application/json' }, payload: '{bad' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(json(res).error.code, 'INVALID_JSON');
+  assert.equal((await app.inject({ method: 'POST', url: '/v1/jobs', headers: { ...bearer(WRITE_KEY), 'content-type': 'application/json' }, payload: '' })).statusCode, 400, 'empty body on a route that needs one');
   const badRun = json(await app.inject({ method: 'POST', url: '/v1/jobs/bad/run', headers: bearer(WRITE_KEY) })).run;
 
   await worker.tick();

@@ -53,6 +53,16 @@ export class SchedulerApi {
       ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
     });
     app.decorateRequest('apiKey', /** @type {any} */ (null));
+    // Action endpoints (run, cancel) take no body; clients that always send a JSON content type must not get a parse error.
+    app.removeContentTypeParser('application/json');
+    app.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => {
+      if (body === '') return done(null, undefined);
+      try {
+        done(null, JSON.parse(/** @type {string} */ (body)));
+      } catch {
+        done(Object.assign(new Error('body is not valid JSON'), { statusCode: 400, code: 'INVALID_JSON' }), undefined);
+      }
+    });
     app.setErrorHandler(this.#errorHandler);
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });

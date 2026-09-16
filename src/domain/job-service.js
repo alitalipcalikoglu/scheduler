@@ -146,12 +146,15 @@ export class JobService {
 
   /**
    * Turn one due job into a run and advance its pointer. Overlap is refused: when the previous run
-   * is still active the firing is recorded as `skipped`.
+   * is still active the firing is recorded as `skipped`. Returns null when the job was changed
+   * between being read and being fired (paused, deleted, rescheduled or already fired).
    * @param {JobRow} job
    * @param {number} now
    */
   fire(job, now) {
     return this.db.transaction(() => {
+      const fresh = this.jobs.get(job.name);
+      if (!fresh || fresh.enabled !== 1 || fresh.next_run_at !== job.next_run_at) return null;
       const scheduledFor = /** @type {number} */ (job.next_run_at);
       const active = this.runs.hasActive(job.name);
       const run = this.runs.insert({
@@ -171,7 +174,7 @@ export class JobService {
    */
   fireDue(now) {
     const due = this.jobs.due(now, JobService.DUE_BATCH);
-    return due.map((job) => this.fire(job, now));
+    return due.map((job) => this.fire(job, now)).filter((run) => run !== null);
   }
 
   /** @param {number} id */

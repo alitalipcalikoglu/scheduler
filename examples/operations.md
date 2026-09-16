@@ -33,7 +33,7 @@ Alert on `scheduler_next_due_seconds` staying negative (the worker is not firing
 
 Required: `SCHEDULER_API_KEYS`, `SIGNING_SECRET`. Full list with defaults: [.env.example](../.env.example).
 
-One process per database file. The worker lives inside the API process; there is no separate worker binary. Two instances on one database would both fire jobs (claims are transactional, so a run executes once, but the pointer advance is per process and the fired run may be marked `skipped` by the other); run exactly one.
+One process per database file. The worker lives inside the API process; there is no separate worker binary. Firing and claiming are transactional and re-check the job's pointer, so a second process on the same file would not duplicate work, but SQLite on a shared or network filesystem is not supported: run exactly one.
 
 ## Process manager
 

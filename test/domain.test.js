@@ -66,6 +66,7 @@ test('JobService: firing, overlap, manual trigger and cancel', () => {
   service.create({ name: 'j', schedule: { cron: '0 * * * *' }, target: { url: 'https://api.example/x' }, retry: { max: 2 } }, 'console', T0);
   service.create({ name: 'once', schedule: { at: '2026-09-17T11:00:00Z' }, target: { url: 'https://api.example/x' } }, 'console', T0);
   assert.deepEqual(service.fireDue(clock.now()), [], 'nothing due yet');
+  assert.equal(service.fire({ .../** @type {any} */ (jobs.get('j')), next_run_at: 1 }, clock.now()), null, 'pointer mismatch: nothing fired');
   clock.advance(61 * 60_000); // 11:01
   const fired = service.fireDue(clock.now());
   assert.deepEqual(fired.map((r) => [r.job_name, r.status, r.max_attempts]), [['j', 'pending', 3], ['once', 'pending', 4]]);

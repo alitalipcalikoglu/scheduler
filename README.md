@@ -145,13 +145,21 @@ do not propagate `X-Request-Id` or `traceparent` onward. See
 ## Backup / restore
 
 The only state that needs to survive a disk loss is the SQLite file at `DB_PATH` (jobs and run
-history), including its `-wal`/`-shm` sidecars while the process is live. There is no backup
-mechanism built into this codebase today; capture it with the `sqlite3` CLI's `.backup` (or
-`VACUUM INTO`) against the live file, or stop the process and copy the file directly. Restoring
-means stopping the process, replacing the file, and starting again — `Database` runs its migration
-check on open, so a slightly older backup catches up automatically. `scheduler`'s tables are
-self-contained; there is no cross-service data-ordering constraint to restoring it. See
-[docs/READINESS.md](docs/READINESS.md) for the full contract.
+history), including its `-wal`/`-shm` sidecars while the process is live. Use `stack backup`/
+`stack restore` from the workspace root (see `stack/docs/UPGRADE.md`) to snapshot and restore this
+consistently alongside the rest of the stack — it uses `VACUUM INTO` against the live file, so
+stopping the process first is not required. Restoring means stopping the process, replacing the
+file, and starting again — `Database` runs its migration check on open, so a slightly older backup
+catches up automatically. On every start, before applying a pending migration to an existing
+database, the service itself also snapshots the file to `DB_PATH.pre-v<N>-<timestamp>` (directory
+overridable with `DB_BACKUP_DIR`) — a manual last resort if `stack restore` is unavailable.
+`scheduler`'s tables are self-contained; there is no cross-service data-ordering constraint to
+restoring it.
+
+**Rollback limitations:** none of the migrations are reversible; to roll back, restore the
+pre-migration copy (or a `stack backup` snapshot taken before the upgrade) and run the previous
+version of this service against it. See [docs/READINESS.md](docs/READINESS.md) for the full
+contract.
 
 ## License
 

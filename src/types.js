@@ -22,6 +22,7 @@
  * @property {{ url: string, apiKey: string }|null} audit   Audit service to forward events to; null = off.
  * @property {number} bodyLimit
  * @property {string} dbPath
+ * @property {string} [dbBackupDir]
  * @property {ApiKey[]} apiKeys
  * @property {string} signingSecret
  * @property {Map<string, string>} targetKeys     Named bearer tokens jobs may reference; never stored or returned.

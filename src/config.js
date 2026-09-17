@@ -21,6 +21,7 @@ export class Config {
     this.audit = v.audit;
     this.bodyLimit = v.bodyLimit;
     this.dbPath = v.dbPath;
+    this.dbBackupDir = v.dbBackupDir;
     this.apiKeys = v.apiKeys;
     this.signingSecret = v.signingSecret;
     this.targetKeys = v.targetKeys;
@@ -72,6 +73,7 @@ export class Config {
       audit: parseAudit(r),
       bodyLimit: r.integer('BODY_LIMIT', 65_536, { min: 1_024 }),
       dbPath: r.optional('DB_PATH') || './data/scheduler.db',
+      dbBackupDir: r.optional('DB_BACKUP_DIR') || undefined,
       apiKeys: Config.#parseApiKeys(r.required('SCHEDULER_API_KEYS')),
       signingSecret,
       targetKeys: Config.#parseTargetKeys(r.optional('TARGET_KEYS')),

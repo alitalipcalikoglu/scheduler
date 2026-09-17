@@ -21,7 +21,7 @@ export class Application {
   constructor(config) {
     this.config = config;
     this.audit = new AuditClient({ target: config.audit });
-    this.db = new Database(config.dbPath);
+    this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.jobs = new JobStore(this.db);
     this.runs = new RunStore(this.db);
     const guard = new NetGuard({ allowHttp: config.targetAllowHttp, allowPrivate: config.targetAllowPrivate, allowedHosts: config.targetAllowedHosts });

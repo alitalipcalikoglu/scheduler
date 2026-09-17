@@ -1,4 +1,5 @@
 import { Config } from './config.js';
+import { AuditClient } from './net/audit-client.js';
 import { Database } from './db.js';
 import { JobService } from './domain/job-service.js';
 import { ScheduleRule } from './domain/schedule.js';
@@ -18,6 +19,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath);
     this.jobs = new JobStore(this.db);
     this.runs = new RunStore(this.db);
@@ -48,11 +50,13 @@ export class Application {
     const { config } = this;
     const worker = new Worker({ service: this.service, jobs: this.jobs, runs: this.runs, caller: this.caller, log: /** @type {any} */ (console), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec } });
     this.worker = worker;
-    const api = new SchedulerApi({ config, service: this.service, jobs: this.jobs, runs: this.runs, worker, db: this.db });
+    const api = new SchedulerApi({ config, audit: this.audit, service: this.service, jobs: this.jobs, runs: this.runs, worker, db: this.db });
     const app = await api.build();
     this.app = app;
     worker.log = app.log.child({ component: 'worker' });
     this.#installSignalHandlers(app.log);
+    this.audit.logger = app.log;
+    this.audit.start();
     await app.listen({ port: config.port, host: config.host });
     app.log.info({ tls: config.tls !== null, jobs: this.jobs.counts().total, targetKeys: [...config.targetKeys.keys()] }, config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
     worker.start();
@@ -71,6 +75,7 @@ export class Application {
     }, this.config.maxTimeoutMs + 10_000).unref();
     try {
       await this.app?.close();
+      await this.audit.close();
       await this.worker?.stop();
       this.db.close();
       clearTimeout(forceExit);

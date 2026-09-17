@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
+import { AuditClient } from '../net/audit-client.js';
 import { SchedulerError } from '../domain/errors.js';
 import { RunStore } from '../store/run-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
@@ -26,9 +27,11 @@ export class SchedulerApi {
    * @param {import('../worker.js').Worker} deps.worker
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
+   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
    */
-  constructor({ config, service, jobs, runs, worker, db, logger }) {
+  constructor({ config, audit, service, jobs, runs, worker, db, logger }) {
     this.config = config;
+    this.audit = audit;
     this.service = service;
     this.jobs = jobs;
     this.runs = runs;
@@ -64,6 +67,7 @@ export class SchedulerApi {
       }
     });
     app.setErrorHandler(this.#errorHandler);
+    app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
@@ -140,7 +144,7 @@ export class SchedulerApi {
     const query = (/** @type {FastifyRequest} */ r) => /** @type {Record<string, string|undefined>} */ (r.query);
 
     // ---- jobs
-    api.post('/jobs', { ...write, schema: { body: Schemas.create } }, async (request, reply) => {
+    api.post('/jobs', { config: { audit: AuditClient.route('scheduler.job.create', (_r, b) => ({ type: 'job', id: b.job.name })) }, ...write, schema: { body: Schemas.create } }, async (request, reply) => {
       const row = s.create(/** @type {any} */ (request.body), request.apiKey.id);
       reply.header('location', `/v1/jobs/${row.name}`);
       return reply.code(201).send({ job: Views.job(row) });
@@ -154,14 +158,14 @@ export class SchedulerApi {
 
     api.get('/jobs/:name', { ...read, schema: { params: Schemas.nameParams } }, async (request) => ({ job: Views.job(s.get(name(request))) }));
 
-    api.patch('/jobs/:name', { ...write, schema: { params: Schemas.nameParams, body: Schemas.patch } }, async (request) => ({ job: Views.job(s.update(name(request), /** @type {any} */ (request.body))) }));
+    api.patch('/jobs/:name', { config: { audit: AuditClient.route('scheduler.job.update', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name }), (r) => ({ patch: r.body })) }, ...write, schema: { params: Schemas.nameParams, body: Schemas.patch } }, async (request) => ({ job: Views.job(s.update(name(request), /** @type {any} */ (request.body))) }));
 
-    api.delete('/jobs/:name', { ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => {
+    api.delete('/jobs/:name', { config: { audit: AuditClient.route('scheduler.job.delete', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name })) }, ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => {
       s.remove(name(request));
       return reply.code(204).send();
     });
 
-    api.post('/jobs/:name/run', { ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => reply.code(202).send({ run: Views.run(s.trigger(name(request))) }));
+    api.post('/jobs/:name/run', { config: { audit: AuditClient.route('scheduler.job.run', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name }), (_r, b) => ({ run: b?.run?.id })) }, ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => reply.code(202).send({ run: Views.run(s.trigger(name(request))) }));
 
     api.get('/jobs/:name/runs', { ...read, schema: { params: Schemas.nameParams, querystring: Schemas.runsQuery } }, async (request) => {
       s.get(name(request));
@@ -171,7 +175,7 @@ export class SchedulerApi {
     // ---- runs
     api.get('/runs', { ...read, schema: { querystring: Schemas.runsQuery } }, async (request) => this.#runs(query(request)));
     api.get('/runs/:id', { ...read, schema: { params: Schemas.idParams } }, async (request) => ({ run: Views.run(s.run(id(request))) }));
-    api.post('/runs/:id/cancel', { ...write, schema: { params: Schemas.idParams } }, async (request) => ({ run: Views.run(s.cancelRun(id(request))) }));
+    api.post('/runs/:id/cancel', { config: { audit: AuditClient.route('scheduler.run.cancel', (r) => ({ type: 'run', id: /** @type {any} */ (r.params).id })) }, ...write, schema: { params: Schemas.idParams } }, async (request) => ({ run: Views.run(s.cancelRun(id(request))) }));
 
     // ---- helpers for operators and consoles
     api.get('/schedule/preview', { ...read, schema: { querystring: Schemas.previewQuery } }, async (request) => {

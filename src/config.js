@@ -23,6 +23,7 @@ export class Config {
     this.logLevel = v.logLevel;
     this.trustProxy = v.trustProxy;
     this.tls = v.tls;
+    this.audit = v.audit;
     this.bodyLimit = v.bodyLimit;
     this.dbPath = v.dbPath;
     this.apiKeys = v.apiKeys;
@@ -75,6 +76,7 @@ export class Config {
       logLevel: r.optional('LOG_LEVEL') || 'info',
       trustProxy: r.boolean('TRUST_PROXY', false),
       tls: certPath ? { certPath, keyPath } : null,
+      audit: Config.#parseAudit(r),
       bodyLimit: r.integer('BODY_LIMIT', 65_536, { min: 1_024 }),
       dbPath: r.optional('DB_PATH') || './data/scheduler.db',
       apiKeys: Config.#parseApiKeys(r.required('SCHEDULER_API_KEYS')),
@@ -135,6 +137,19 @@ export class Config {
       keys.set(name, secret);
     }
     return keys;
+  }
+  /**
+   * `AUDIT_URL` + `AUDIT_API_KEY`: both or neither. Empty = audit events are not forwarded.
+   * @param {EnvReader} r
+   */
+  static #parseAudit(r) {
+    const url = r.optional('AUDIT_URL').replace(/\/+$/, '');
+    const apiKey = r.optional('AUDIT_API_KEY');
+    if (!url && !apiKey) return null;
+    if (!url || !apiKey) throw new ConfigError('AUDIT_URL and AUDIT_API_KEY must be set together');
+    if (!/^https?:\/\/[^\s]+$/.test(url)) throw new ConfigError('AUDIT_URL must be an absolute http(s) URL');
+    if (apiKey.length < 32) throw new ConfigError('AUDIT_API_KEY must be at least 32 characters');
+    return { url, apiKey };
   }
 }
 

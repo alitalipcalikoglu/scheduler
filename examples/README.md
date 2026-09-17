@@ -14,6 +14,7 @@ Scenario-driven walkthroughs of every feature. Requests to `/v1/*` need `Authori
 | [Scheduling a flag change](flags-scheduled-change.md) | Enable a feature flag at 09:00 through the flags service |
 | [API keys and roles](keys-and-roles.md) | Read, write, readwrite; rate limit; error codes |
 | [Operations](operations.md) | Health, readiness, metrics, environment, PM2, Docker, backups |
+| [Audit events](audit-events.md) | Which write actions are forwarded to the audit service, event shape, configuration |
 
 Set up once for the examples:
 

@@ -5,7 +5,7 @@ import { JobService } from '../src/domain/job-service.js';
 import { ScheduleRule } from '../src/domain/schedule.js';
 import { SchedulerApi } from '../src/http/scheduler-api.js';
 import { HttpCaller } from '../src/net/http-caller.js';
-import { NetGuard } from '../src/net/net-guard.js';
+import { NetGuard } from '@atc-web/service-core/http';
 import { Signer } from '../src/net/signer.js';
 import { JobStore } from '../src/store/job-store.js';
 import { RunStore } from '../src/store/run-store.js';

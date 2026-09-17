@@ -1,11 +1,12 @@
 import { Config } from './config.js';
-import { AuditClient } from './net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
+import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { Database } from './db.js';
 import { JobService } from './domain/job-service.js';
 import { ScheduleRule } from './domain/schedule.js';
 import { SchedulerApi } from './http/scheduler-api.js';
 import { HttpCaller } from './net/http-caller.js';
-import { NetGuard } from './net/net-guard.js';
+import { NetGuard } from '@atc-web/service-core/http';
 import { Signer } from './net/signer.js';
 import { JobStore } from './store/job-store.js';
 import { RunStore } from './store/run-store.js';
@@ -30,7 +31,8 @@ export class Application {
     this.app = null;
     /** @type {Worker|null} */
     this.worker = null;
-    this.shuttingDown = false;
+    /** @type {(reason: string) => Promise<void>} */
+    this.shutdown = async () => {};
   }
 
   /** Build from `process.env`; exits with a readable message on bad configuration. */
@@ -54,7 +56,19 @@ export class Application {
     const app = await api.build();
     this.app = app;
     worker.log = app.log.child({ component: 'worker' });
-    this.#installSignalHandlers(app.log);
+    // Order preserved exactly as before this extraction (audit flushes before the worker drains
+    // in-flight runs) — a known, separately tracked defect, not something to fix here.
+    const { shutdown } = Lifecycle.install({
+      forceExitMs: this.config.maxTimeoutMs + 10_000,
+      log: app.log,
+      steps: [
+        () => this.app?.close(),
+        () => this.audit.close(),
+        () => this.worker?.stop(),
+        () => this.db.close(),
+      ],
+    });
+    this.shutdown = shutdown;
     this.audit.logger = app.log;
     this.audit.start();
     await app.listen({ port: config.port, host: config.host });
@@ -63,41 +77,4 @@ export class Application {
     if (process.send) process.send('ready'); // PM2 wait_ready
   }
 
-  /** @param {string} reason */
-  async shutdown(reason) {
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-    const log = /** @type {import('./types.js').Logger} */ (this.app?.log ?? console);
-    log.info({ reason }, 'shutting down');
-    const forceExit = setTimeout(() => {
-      log.error('shutdown timed out, exiting');
-      process.exit(1);
-    }, this.config.maxTimeoutMs + 10_000).unref();
-    try {
-      await this.app?.close();
-      await this.audit.close();
-      await this.worker?.stop();
-      this.db.close();
-      clearTimeout(forceExit);
-      log.info('shutdown complete');
-      process.exit(0);
-    } catch (err) {
-      log.error({ err }, 'shutdown failed');
-      process.exit(1);
-    }
-  }
-
-  /** @param {import('./types.js').Logger} log */
-  #installSignalHandlers(log) {
-    process.on('SIGTERM', () => this.shutdown('SIGTERM'));
-    process.on('SIGINT', () => this.shutdown('SIGINT'));
-    process.on('unhandledRejection', (reason) => {
-      log.fatal({ err: reason }, 'unhandled rejection');
-      this.shutdown('unhandledRejection');
-    });
-    process.on('uncaughtException', (err) => {
-      log.fatal({ err }, 'uncaught exception');
-      process.exit(1);
-    });
-  }
 }

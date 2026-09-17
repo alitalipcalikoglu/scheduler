@@ -36,7 +36,7 @@ export class JobService {
    * @param {import('../db.js').Database} deps.db
    * @param {import('../store/job-store.js').JobStore} deps.jobs
    * @param {import('../store/run-store.js').RunStore} deps.runs
-   * @param {import('../net/net-guard.js').NetGuard} deps.guard
+   * @param {import('@atc-web/service-core/http').NetGuard} deps.guard
    * @param {ScheduleRule} deps.schedule
    * @param {{ targetKeys: Map<string, string>, defaultTimeoutMs: number, maxTimeoutMs: number, maxRetries: number, maxBackoffSec: number, maxBodyBytes: number }} deps.options
    * @param {() => number} [deps.now]

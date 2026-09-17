@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { READ_KEY, RW_KEY, WRITE_KEY, bearer, buildApp, targetServer } from './helpers.js';
+import { READ_KEY, RW_KEY, VERSION, WRITE_KEY, bearer, buildApp, targetServer } from './helpers.js';
 
 const json = (/** @type {import('light-my-request').Response} */ r) => JSON.parse(r.body);
 
@@ -145,4 +145,18 @@ test('API: schedule preview, target keys, timezones', async (t) => {
   assert.equal(json(await app.inject({ url: '/v1/schedule/preview?cron=@daily', headers: bearer(READ_KEY) })).next.length, 5);
   assert.deepEqual(json(await app.inject({ url: '/v1/target-keys', headers: bearer(READ_KEY) })), { items: ['flags'] });
   assert.ok(json(await app.inject({ url: '/v1/timezones', headers: bearer(READ_KEY) })).items.includes('Europe/Istanbul'));
+});
+
+test('API: /v1/info', async (t) => {
+  const { app } = await buildApp();
+  t.after(() => app.close());
+  const res = await app.inject({ url: '/v1/info' });
+  assert.equal(res.statusCode, 200);
+  const body = json(res);
+  assert.equal(body.service, 'scheduler');
+  assert.equal(body.version, VERSION);
+  assert.equal(body.apiVersion, 'v1');
+  assert.deepEqual(body.capabilities, ['cron-schedule', 'one-off-schedule', 'retry-backoff', 'http-target']);
+  assert.equal(typeof body.schemaVersion, 'number');
+  assert.equal(typeof body.serviceCore, 'string');
 });

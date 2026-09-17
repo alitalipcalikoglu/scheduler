@@ -8,6 +8,7 @@ import { SchedulerApi } from './http/scheduler-api.js';
 import { ConsoleLogger } from '@atc-web/service-core/log';
 import { HttpCaller } from './net/http-caller.js';
 import { NetGuard } from '@atc-web/service-core/http';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Signer } from './net/signer.js';
 import { HeartbeatStore } from './store/heartbeat-store.js';
 import { JobStore } from './store/job-store.js';
@@ -39,6 +40,7 @@ export class Application {
     this.config = config;
     this.role = role;
     this.audit = new AuditClient({ target: config.audit });
+    this.version = readServiceVersion(import.meta.url);
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.jobs = new JobStore(this.db);
     this.runs = new RunStore(this.db);
@@ -89,7 +91,7 @@ export class Application {
     const steps = [];
 
     if (runsApi) {
-      const api = new SchedulerApi({ config, audit: this.audit, service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, worker: this.worker, db: this.db });
+      const api = new SchedulerApi({ config, audit: this.audit, service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, worker: this.worker, db: this.db, version: this.version });
       const app = await api.build();
       this.app = app;
       log = app.log;

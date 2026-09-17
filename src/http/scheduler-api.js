@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, jsonParser, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, jsonParser, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { SchedulerError } from '../domain/errors.js';
 import { RunStore } from '../store/run-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
@@ -40,10 +40,11 @@ export class SchedulerApi {
    * @param {import('../store/heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {import('../worker.js').Worker|null} deps.worker
    * @param {import('../db.js').Database} deps.db
+   * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, service, jobs, runs, presence, worker, db, logger }) {
+  constructor({ config, audit, service, jobs, runs, presence, worker, db, version, logger }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
@@ -52,6 +53,7 @@ export class SchedulerApi {
     this.presence = presence;
     this.worker = worker;
     this.db = db;
+    this.version = version;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
   }
@@ -89,6 +91,12 @@ export class SchedulerApi {
       reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: SchedulerApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
+    registerInfo(app, {
+      service: 'scheduler',
+      version: this.version,
+      capabilities: ['cron-schedule', 'one-off-schedule', 'retry-backoff', 'http-target'],
+      schemaVersion: this.db.schemaVersion,
+    });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;

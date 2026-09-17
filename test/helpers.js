@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { Config } from '../src/config.js';
 import { Database } from '../src/db.js';
 import { JobService } from '../src/domain/job-service.js';
@@ -11,6 +12,8 @@ import { HeartbeatStore } from '../src/store/heartbeat-store.js';
 import { JobStore } from '../src/store/job-store.js';
 import { RunStore } from '../src/store/run-store.js';
 import { Worker } from '../src/worker.js';
+
+export const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 export const RW_KEY = 'k'.repeat(40);
 export const READ_KEY = 'r'.repeat(40);
@@ -70,7 +73,7 @@ export function testService(overrides) {
   const service = new JobService({ db, jobs, runs, guard, schedule: new ScheduleRule({ defaultTimezone: config.defaultTimezone }), options: config, now: clock.now });
   const caller = new HttpCaller({ signer: new Signer(config.signingSecret), guard, targetKeys: config.targetKeys, now: clock.now });
   const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: 5_000 }, now: clock.now });
-  return { config, clock, db, jobs, runs, presence, guard, service, caller, worker };
+  return { config, clock, db, jobs, runs, presence, guard, service, caller, worker, version: VERSION };
 }
 
 /**

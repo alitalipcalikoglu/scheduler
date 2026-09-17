@@ -43,6 +43,14 @@ npm run typecheck
 - **Outbound safety**: `https://` only unless `TARGET_ALLOW_HTTP`; hosts allowlisted with `TARGET_ALLOWED_HOSTS`; private and loopback addresses blocked unless `TARGET_ALLOW_PRIVATE` (which requires the allowlist); the resolved address is pinned for the connection.
 - **Missed firings** while the process was down collapse into one catch-up run at start; the run's `scheduledFor` shows the slot.
 
+## Boundaries
+
+**Purpose:** run one HTTP call at a time, on a schedule or once, with retry.
+
+**Responsibilities:** cron and one-off scheduling with timezone awareness; HTTP-target execution with retry/backoff; run history.
+
+**Non-responsibilities:** scheduler ≠ generic queue — one named job triggers one HTTP call; there is no arbitrary task payload, no pub/sub, nothing another service can enqueue work onto beyond calling a pre-registered job's own trigger endpoint. It does not fan a single trigger out to multiple targets.
+
 ## API
 
 Errors are JSON: `{ "error": { "code", "message", "details?" } }`.

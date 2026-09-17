@@ -82,7 +82,7 @@ export class Application {
       // Stage 6.1: drainMs bounds the worker's own wait for in-flight calls, strictly less than
       // forceExitMs below (same call-timeout ceiling, smaller margin) so a stuck drain logs and
       // lets the remaining shutdown steps at least attempt to run before the process force-exits.
-      this.worker = new Worker({ service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, caller: this.caller, log: log.child({ component: 'worker' }), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: config.maxTimeoutMs + 5_000 } });
+      this.worker = new Worker({ service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, caller: this.caller, log: log.child({ component: 'worker' }), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: config.drainMs } });
     }
 
     /** @type {(() => (void|Promise<void>))[]} */
@@ -109,7 +109,7 @@ export class Application {
     steps.push(() => this.audit.close());
     steps.push(() => this.db.close());
 
-    const { shutdown } = Lifecycle.install({ forceExitMs: config.maxTimeoutMs + 10_000, log, steps });
+    const { shutdown } = Lifecycle.install({ forceExitMs: config.forceExitMs, log, steps });
     this.shutdown = shutdown;
     this.audit.logger = log;
     this.audit.start();

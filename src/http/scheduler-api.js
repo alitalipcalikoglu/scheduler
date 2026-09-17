@@ -14,10 +14,22 @@ import { Views } from './views.js';
 /** @typedef {import('fastify').FastifyInstance} FastifyInstance */
 /** @typedef {import('fastify').FastifyRequest} FastifyRequest */
 
-/** HTTP surface: job management (write role), runs, previews and stats (read role). */
+/**
+ * HTTP surface: job management (write role), runs, previews and stats (read role).
+ *
+ * `worker` is `null` in the API-only role (Stage 6, `src/api-main.js`) — there is no in-process
+ * `Worker` to read `.running`/`.inFlight`/`.counters` from, so readiness and stats fall back to
+ * `presence` (`worker_heartbeat`, is ANY worker process alive right now) and `runs.runningCount()`
+ * (how many runs are in flight, durable and true regardless of which process is running them).
+ * `counters` (succeeded/failed/retried/skipped *since this process started*) has no DB-backed
+ * equivalent by design — it is inherently per-process — so it reports `null` from an API-only
+ * process rather than a misleading always-zero.
+ */
 export class SchedulerApi {
   static READY_CACHE_MS = 10_000;
   static STATS_WINDOW_MS = 86_400_000;
+  /** A worker_heartbeat row older than this many worker heartbeat intervals is considered dead. */
+  static PRESENCE_STALE_FACTOR = 4;
 
   /**
    * @param {object} deps
@@ -25,21 +37,30 @@ export class SchedulerApi {
    * @param {import('../domain/job-service.js').JobService} deps.service
    * @param {import('../store/job-store.js').JobStore} deps.jobs
    * @param {import('../store/run-store.js').RunStore} deps.runs
-   * @param {import('../worker.js').Worker} deps.worker
+   * @param {import('../store/heartbeat-store.js').HeartbeatStore} deps.presence
+   * @param {import('../worker.js').Worker|null} deps.worker
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, service, jobs, runs, worker, db, logger }) {
+  constructor({ config, audit, service, jobs, runs, presence, worker, db, logger }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
     this.jobs = jobs;
     this.runs = runs;
+    this.presence = presence;
     this.worker = worker;
     this.db = db;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
+  }
+
+  /** `'running'`/`'stopped'`, from the in-process `Worker` when there is one, else from `worker_heartbeat`. @param {number} [now] */
+  workerStatus(now = Date.now()) {
+    if (this.worker) return this.worker.running ? 'running' : 'stopped';
+    const seenAt = this.presence.latest();
+    return seenAt !== null && now - seenAt < this.config.heartbeatMs * SchedulerApi.PRESENCE_STALE_FACTOR ? 'running' : 'stopped';
   }
 
   /** @returns {Promise<FastifyInstance>} */
@@ -67,7 +88,7 @@ export class SchedulerApi {
       reply.header('x-content-type-options', 'nosniff');
       reply.header('cache-control', 'no-store');
     });
-    registerProbes(app, () => this.db.ping(), { cacheMs: SchedulerApi.READY_CACHE_MS, extra: () => ({ worker: this.worker.running ? 'running' : 'stopped' }) });
+    registerProbes(app, () => this.db.ping(), { cacheMs: SchedulerApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
@@ -152,7 +173,9 @@ export class SchedulerApi {
     return {
       jobs: { total: j.total, enabled: j.enabled, scheduled: j.scheduled, nextDueAt: Views.iso(j.nextDueAt) },
       runs: { byStatus: r.byStatus, last24h: r.recentByStatus, avgDurationMs24h: r.recentAvgDurationMs, topFailures24h: r.recentFailures },
-      worker: { running: this.worker.running, inFlight: this.worker.inFlight.size, concurrency: this.config.workerConcurrency, sinceStart: { ...this.worker.counters } },
+      worker: this.worker
+        ? { running: this.worker.running, inFlight: this.worker.inFlight.size, concurrency: this.config.workerConcurrency, sinceStart: { ...this.worker.counters } }
+        : { running: this.workerStatus(now) === 'running', inFlight: this.runs.runningCount(), concurrency: this.config.workerConcurrency, sinceStart: null },
     };
   }
 
@@ -162,7 +185,10 @@ export class SchedulerApi {
     ops.get('/metrics', { logLevel: 'warn', preValidation: ApiKeyAuth.require('read') }, async (_request, reply) => {
       const j = this.jobs.counts();
       const r = this.runs.stats(Date.now() - SchedulerApi.STATS_WINDOW_MS);
-      const c = this.worker.counters;
+      // Process-local since-start counters: zero (not omitted) from an API-only process — honest,
+      // since this process itself never finished a run, rather than a gap a scraper has to explain.
+      const c = this.worker?.counters ?? { succeeded: 0, failed: 0, retried: 0, skipped: 0 };
+      const inFlight = this.worker ? this.worker.inFlight.size : this.runs.runningCount();
       reply.type('text/plain; version=0.0.4; charset=utf-8');
       return [
         '# HELP scheduler_jobs Jobs by state.',
@@ -172,17 +198,20 @@ export class SchedulerApi {
         '# HELP scheduler_runs Stored runs by status.',
         '# TYPE scheduler_runs gauge',
         ...RunStore.STATUSES.map((s) => `scheduler_runs{status="${s}"} ${r.byStatus[s]}`),
-        '# HELP scheduler_runs_finished_total Run outcomes since process start.',
+        '# HELP scheduler_runs_finished_total Run outcomes since process start. Zero from an API-only process (this role never finishes a run itself).',
         '# TYPE scheduler_runs_finished_total counter',
         `scheduler_runs_finished_total{status="succeeded"} ${c.succeeded}`,
         `scheduler_runs_finished_total{status="failed"} ${c.failed}`,
         `scheduler_runs_finished_total{status="skipped"} ${c.skipped}`,
-        '# HELP scheduler_attempts_retried_total Attempts that failed and were rescheduled since process start.',
+        '# HELP scheduler_attempts_retried_total Attempts that failed and were rescheduled since process start. Zero from an API-only process.',
         '# TYPE scheduler_attempts_retried_total counter',
         `scheduler_attempts_retried_total ${c.retried}`,
-        '# HELP scheduler_in_flight Calls currently executing.',
+        '# HELP scheduler_in_flight Calls currently executing (durable, from the runs table, when this process has no worker of its own).',
         '# TYPE scheduler_in_flight gauge',
-        `scheduler_in_flight ${this.worker.inFlight.size}`,
+        `scheduler_in_flight ${inFlight}`,
+        '# HELP scheduler_worker_up 1 if a worker process is currently alive (this process itself, or another one reporting through worker_heartbeat), else 0.',
+        '# TYPE scheduler_worker_up gauge',
+        `scheduler_worker_up ${this.workerStatus() === 'running' ? 1 : 0}`,
         '# HELP scheduler_next_due_seconds Seconds until the next scheduled firing (negative = overdue), -1 when nothing is scheduled.',
         '# TYPE scheduler_next_due_seconds gauge',
         `scheduler_next_due_seconds ${j.nextDueAt === null ? -1 : ((j.nextDueAt - Date.now()) / 1000).toFixed(0)}`,

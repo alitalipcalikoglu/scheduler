@@ -115,22 +115,45 @@ Class-based; dependencies are injected through constructors, `src/application.js
 - Sub-minute schedules: the smallest cron unit is a minute; a receiver that needs a tighter loop should own it.
 - Payload templating (dates in the body): receivers know the time from `X-Scheduler-Timestamp` and the run's `scheduledFor`.
 - Push notifications on failure: poll `/v1/stats` or scrape `/metrics`; a notify job can be a receiver's responsibility.
-- Multi-node execution: one process per database; scale by splitting jobs across instances.
+- True multi-host distribution: every process (API or worker, however many) must reach the same `DB_PATH` file on one host — there is no network-shared counter store. Splitting a workload across hosts still means splitting jobs across separate `scheduler` instances, each with its own database.
 
 ## Audit events
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
-## Scaling model
+## API/worker runtime split
 
-Single-node stateful: one process owns the SQLite file at `DB_PATH` (`instances: 1` in
-`ecosystem.config.cjs`, "one process per SQLite file"), with the worker loop and the database
-connection living in that one process. Two instances against the same file would not double-fire a
-job or double-claim a run — the firing and claiming updates are guarded by SQLite's own write-lock
-serialization plus a conditional re-check of state — but a second instance adds no throughput
-(both poll and contend for the same due rows) and does not improve crash recovery, since a killed
-instance's stuck runs are only reaped by a process's own startup, not observed by a sibling
-process. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+`src/index.js` (default) runs both the HTTP API and the worker loop in one process — nothing about
+existing single-process deployments changes. Two more entry points exist for a split deployment:
+`src/api-main.js` (HTTP only, never claims a run) and `src/worker-main.js` (worker only, no HTTP
+listener at all, not even for health checks — PM2's own process state is the liveness signal). All
+three share the same `Config`, the same database, the same migrations. `npm run api` / `npm run
+worker` run them directly; `ecosystem.config.cjs` has the split apps ready to uncomment. An
+API-only process's `/ready` and `/v1/stats` report worker liveness and in-flight count from the
+database (`worker_heartbeat`, `runs.status = 'running'`) instead of an in-process `Worker` object —
+the `sinceStart` counters, being inherently per-process, report `null` there rather than a
+misleading zero.
+
+## Lease ownership and scaling model
+
+Every claimed run gets a fencing token (`owner_token`) and a lease (`lease_until`), not just a
+status column. A worker renews the lease every `HEARTBEAT_MS` while a call is in flight
+(`LEASE_MS`, default 30s; `HEARTBEAT_MS`, default 10s — must be well under `LEASE_MS`), so a call
+taking longer than `LEASE_MS` never loses its lease on its own. If a worker crashes or hangs long
+enough that its lease genuinely expires, another worker (or the same one, restarted) reclaims the
+run as a failed attempt — following the same retry/backoff policy as an ordinary failure, labeled
+`"lease expired"` or `"interrupted by restart"` — and the fencing token means the original worker,
+if it later finishes the call it no longer owns, cannot overwrite that outcome: its write is
+rejected (`owner_token`/`status` no longer match), not silently accepted.
+
+This makes **multiple worker processes against the same `DB_PATH` a supported topology**, not just
+one that happens not to corrupt data: `ecosystem.config.cjs`'s split `scheduler-worker` app can run
+with `instances` > 1. Claiming is atomic across processes (`BEGIN IMMEDIATE` around the whole
+read-decide-write), proven with real cross-connection concurrency in
+`test/lease-concurrency.test.js`, not just same-process `Promise.all`. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract, including exactly what a Redis-style
+distributed lease would still need on top of this (nothing — SQLite's file lock already gives
+every guarantee this design needs; the topology limit is one host, not one process).
 
 ## Observability
 

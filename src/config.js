@@ -38,6 +38,8 @@ export class Config {
     this.maxBodyBytes = v.maxBodyBytes;
     this.runRetentionDays = v.runRetentionDays;
     this.rateLimitMax = v.rateLimitMax;
+    this.leaseMs = v.leaseMs;
+    this.heartbeatMs = v.heartbeatMs;
     Object.freeze(this);
   }
 
@@ -61,8 +63,19 @@ export class Config {
     if (!CronExpression.isTimezone(defaultTimezone)) throw new ConfigError(`DEFAULT_TIMEZONE "${defaultTimezone}" is not a known IANA timezone`);
 
     const defaultTimeoutMs = r.integer('DEFAULT_TIMEOUT_MS', 30_000, { min: 1_000 });
-    const maxTimeoutMs = r.integer('MAX_TIMEOUT_MS', 60_000, { min: 1_000 });
+    // Bounded (Stage 6): ecosystem.config.cjs's kill_timeout is a static value derived from this
+    // ceiling. An unbounded MAX_TIMEOUT_MS could let an operator configure a single call longer
+    // than PM2 would ever wait during shutdown, silently defeating the graceful-drain design.
+    const maxTimeoutMs = r.integer('MAX_TIMEOUT_MS', 60_000, { min: 1_000, max: 600_000 });
     if (defaultTimeoutMs > maxTimeoutMs) throw new ConfigError('DEFAULT_TIMEOUT_MS must be <= MAX_TIMEOUT_MS');
+
+    // Stage 6: lease ownership. heartbeatMs must stay well under leaseMs — it's the number of
+    // renewals a claim gets before the lease would lapse on its own; requiring strictly less (not
+    // just "different") catches the degenerate case where a single missed heartbeat (event loop
+    // stall, DB busy) would already be enough to lose the lease.
+    const leaseMs = r.integer('LEASE_MS', 30_000, { min: 2_000, max: 300_000 });
+    const heartbeatMs = r.integer('HEARTBEAT_MS', 10_000, { min: 250 });
+    if (heartbeatMs >= leaseMs) throw new ConfigError('HEARTBEAT_MS must be less than LEASE_MS');
 
     return new Config({
       port: r.integer('PORT', 3008, { min: 0, max: 65535 }),
@@ -90,6 +103,8 @@ export class Config {
       maxBodyBytes: r.integer('MAX_BODY_BYTES', 16_384, { min: 64 }),
       runRetentionDays: r.integer('RUN_RETENTION_DAYS', 30, { min: 1 }),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 600, { min: 1 }),
+      leaseMs,
+      heartbeatMs,
     });
   }
 

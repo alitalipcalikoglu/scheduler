@@ -47,5 +47,23 @@ export class Database extends CoreDatabase {
     CREATE INDEX runs_status ON runs (status, id DESC);
     CREATE INDEX runs_created ON runs (created_at);
     `,
+    `
+    -- Stage 6: lease ownership. owner_token is the fencing token — a fresh random value per claim,
+    -- never reused, so a write guarded by "WHERE owner_token = ?" can only ever succeed for whoever
+    -- currently holds the lease. lease_until is renewed by the heartbeat while a call is in flight;
+    -- NULL for every pre-migration 'running' row (there is no legacy lease to compare against, so
+    -- the reclaim query below treats a NULL lease as already expired).
+    ALTER TABLE runs ADD COLUMN owner_token TEXT;
+    ALTER TABLE runs ADD COLUMN lease_until INTEGER;
+    CREATE INDEX runs_lease ON runs (lease_until) WHERE status = 'running';
+
+    -- One row per live worker process (API-only processes have none of their own). Written on a
+    -- timer by any process running a Worker loop; read by an API-only process's /ready and /stats
+    -- in place of the in-process Worker object it doesn't have.
+    CREATE TABLE worker_heartbeat (
+      instance TEXT PRIMARY KEY,
+      seen_at  INTEGER NOT NULL
+    );
+    `,
   ];
 }

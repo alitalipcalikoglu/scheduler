@@ -7,6 +7,7 @@ import { SchedulerApi } from '../src/http/scheduler-api.js';
 import { HttpCaller } from '../src/net/http-caller.js';
 import { NetGuard } from '@atc-web/service-core/http';
 import { Signer } from '../src/net/signer.js';
+import { HeartbeatStore } from '../src/store/heartbeat-store.js';
 import { JobStore } from '../src/store/job-store.js';
 import { RunStore } from '../src/store/run-store.js';
 import { Worker } from '../src/worker.js';
@@ -64,14 +65,18 @@ export function testService(overrides) {
   const db = new Database(':memory:');
   const jobs = new JobStore(db);
   const runs = new RunStore(db);
+  const presence = new HeartbeatStore(db);
   const guard = new NetGuard({ allowHttp: config.targetAllowHttp, allowPrivate: config.targetAllowPrivate, allowedHosts: config.targetAllowedHosts });
   const service = new JobService({ db, jobs, runs, guard, schedule: new ScheduleRule({ defaultTimezone: config.defaultTimezone }), options: config, now: clock.now });
   const caller = new HttpCaller({ signer: new Signer(config.signingSecret), guard, targetKeys: config.targetKeys, now: clock.now });
-  const worker = new Worker({ service, jobs, runs, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec }, now: clock.now });
-  return { config, clock, db, jobs, runs, guard, service, caller, worker };
+  const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs }, now: clock.now });
+  return { config, clock, db, jobs, runs, presence, guard, service, caller, worker };
 }
 
-/** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
+/**
+ * Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra
+ * constructor deps, e.g. an AuditClient, or `{ worker: null }` for the API-only role.
+ */
 export async function buildApp(overrides, deps = {}) {
   const t = testService(overrides);
   const app = await new SchedulerApi({ ...t, ...deps, logger: silent }).build();

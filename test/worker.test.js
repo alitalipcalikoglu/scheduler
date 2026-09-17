@@ -143,7 +143,7 @@ test('Worker: scheduled firings, overlap skip, concurrency and recovery after a 
   // Simulate a crash: claim without executing, then recover with a fresh worker on the same store.
   clock.advance(60_000);
   service.fireDue(clock.now());
-  const [claimed] = runs.claim(clock.now(), 1);
+  const [claimed] = runs.claim(clock.now(), 1, 30_000); // default LEASE_MS
   assert.equal(claimed.status, 'running');
   clock.advance(60_000);
   const [skipped] = service.fireDue(clock.now()).filter((r) => r.job_name === claimed.job_name);

@@ -37,9 +37,15 @@ Schema (`Database.MIGRATIONS[0]`):
   (partial: enabled jobs with a pointer) for the poll query.
 - `runs` — one row per firing/attempt-history: id, job_name (FK to `jobs`, `ON DELETE CASCADE`),
   trigger, status, scheduled_for, attempt, max_attempts, next_attempt_at, started/finished_at,
-  duration_ms, http_status, response, error, attempts (JSON array), created_at. Indexes:
-  `runs_job` (history lookups), `runs_due` (partial, the claim query), `runs_active` (partial, the
-  overlap check), `runs_status`, `runs_created` (retention purge).
+  duration_ms, http_status, response, error, attempts (JSON array), created_at, and, since Stage 6,
+  `owner_token` (the fencing token of whoever currently holds the lease; null when not `running`)
+  and `lease_until` (ms since epoch; null when not `running`, or a pre-Stage-6 leftover row).
+  Indexes: `runs_job` (history lookups), `runs_due` (partial, the claim query), `runs_active`
+  (partial, the overlap check), `runs_status`, `runs_created` (retention purge), `runs_lease`
+  (partial, the reclaim sweep).
+- `worker_heartbeat` — one row per live worker process (`instance` primary key, `seen_at`); written
+  on a timer by any process running a `Worker` loop, read by an API-only process's `/ready` and
+  `/v1/stats` in place of the in-process `Worker` object it doesn't have.
 
 Migration mechanism: `Database.MIGRATIONS` is an ordered array of SQL strings; `#migrate()` reads
 `PRAGMA user_version`, and for every migration index at or above it, runs the SQL inside
@@ -67,34 +73,53 @@ itself never mutates state, never touches `jobs`/`runs`, and never discards in-f
 safe to poll at any frequency; the 10 s cache just means a very tight polling loop will see the
 same cached result rather than re-querying SQLite every call.
 
+Since Stage 6, `worker` comes from either of two sources depending on process role: the combined
+and worker-only roles have an in-process `Worker`, so `worker` is exactly `this.worker.running`; the
+API-only role (`src/api-main.js`) has none, so `SchedulerApi#workerStatus()` instead reads the
+`worker_heartbeat` table's most recent row and reports `"running"` when it is fresher than
+`HEARTBEAT_MS * 4` (`SchedulerApi.PRESENCE_STALE_FACTOR`), `"stopped"` otherwise (including "no
+worker has ever reported in this database").
+
 ## Graceful shutdown
 
 `SIGTERM`/`SIGINT` both call `Application#shutdown(reason)` (`src/application.js`), which is
-idempotent (`this.shuttingDown` guard) and runs, in order:
+idempotent (`Lifecycle.install`'s own `shuttingDown` guard) and runs, in order (Stage 6 fixed this
+order — see below for what it was and why):
 
-1. `this.app?.close()` — Fastify stops accepting new connections and waits for in-flight HTTP
-   requests to finish.
-2. `this.audit.close()` — stops the flush timer and does one final `flush()` of buffered audit
+1. `this.worker?.stopClaiming()` — flips a flag `#pass()` checks before firing due jobs or claiming
+   new runs; whatever is already in flight keeps running. Present only when this process runs a
+   worker at all (skipped in the API-only role, which has no `Worker`).
+2. `this.app?.close()` — Fastify stops accepting new connections and waits for in-flight HTTP
+   requests to finish. Present only in the API and combined roles.
+3. `this.worker?.stop()` — (redundant `running = false`, in case `stopClaiming` alone wasn't
+   called) `await`s every in-flight run (`Promise.allSettled(this.inFlight)`) to finish, so a call
+   to a job's target is never interrupted mid-flight by shutdown, and its heartbeat interval is
+   cleared as each settles.
+4. `this.audit.close()` — stops the flush timer and does one final `flush()` of buffered audit
    events (with its own retry/backoff; see "Retry policy" — this step can itself take up to
    roughly a minute in the worst case if `audit` is unreachable, bounded only by the overall
    force-exit timer below).
-3. `this.worker?.stop()` — stops claiming new runs and `await`s every in-flight target call
-   (`Promise.allSettled(this.inFlight)`) to finish, so a call to a job's target is never
-   interrupted mid-flight by shutdown.
-4. `this.db.close()`.
+5. `this.db.close()`.
+
+**Before Stage 6** step 4 (audit flush) ran *before* step 3 (worker drain) — a run that finished
+during the drain and needed to record an audit event could queue it into a buffer that had already
+been flushed and stopped, leaving it unflushed until process exit. The fix is purely a reordering;
+nothing about how audit buffering itself works changed. `test/runtime.test.js`'s shutdown-order
+test asserts the exact sequence above by wrapping each step and recording call order.
 
 A force-exit timer is armed *before* any of these steps, at `this.config.maxTimeoutMs + 10_000`
-ms — default `60_000 + 10_000 = 70_000` ms (70 s) — and calls `process.exit(1)` if the four steps
-above have not finished by then; it is cleared on successful completion. `unhandledRejection` runs
-the same `shutdown()` path; `uncaughtException` exits immediately with no drain at all.
+ms — default `60_000 + 10_000 = 70_000` ms (70 s) — and calls `process.exit(1)` if the steps above
+have not finished by then; it is cleared on successful completion. `unhandledRejection` runs the
+same `shutdown()` path; `uncaughtException` exits immediately with no drain at all. There is no
+separate per-step drain timeout for `worker.stop()`'s own wait — this one force-exit timer bounds
+the whole sequence, deliberately: two overlapping timeouts would be harder to reason about than one.
 
-Compared to PM2: `ecosystem.config.cjs` sets `kill_timeout: 80000` (80 s). The internal force-exit
-fires at 70 s, 10 s before PM2 would send `SIGKILL` at 80 s — so under default configuration the
-service's own force-exit always wins and PM2's hard kill is never reached in practice. This margin
-shrinks or inverts if an operator raises `MAX_TIMEOUT_MS` without also raising `kill_timeout`: at
-`MAX_TIMEOUT_MS = 70_000` the force-exit timer (80 s) would equal `kill_timeout` (80 s) exactly, and
-above that the two config values would need to be re-checked together — nothing in the code
-enforces this relationship automatically.
+Compared to PM2: `ecosystem.config.cjs` sets `kill_timeout: 630000` (630 s). Stage 6 also bounded
+`MAX_TIMEOUT_MS` itself (`config.js`, `max: 600_000`) — previously unbounded, which meant an
+operator could configure a job timeout longer than PM2 would ever wait during shutdown, silently
+defeating the graceful-drain design; now the worst case the force-exit timer can reach is
+`600_000 + 10_000 = 610_000` ms, comfortably under `kill_timeout`'s fixed 630 s ceiling regardless
+of how `MAX_TIMEOUT_MS` is configured within its validated range.
 
 ## Resource limits
 
@@ -120,8 +145,15 @@ enforces this relationship automatically.
 
 - `DEFAULT_TIMEOUT_MS` (default 30 000 ms): per-call timeout used when a job does not set its own
   `timeoutMs`.
-- `MAX_TIMEOUT_MS` (default 60 000 ms): the largest `timeoutMs` a job may request (validated in
-  `JobService#timeout`); also backs the shutdown force-exit timer above.
+- `MAX_TIMEOUT_MS` (default 60 000 ms, range 1 000–600 000, bounded since Stage 6): the largest
+  `timeoutMs` a job may request (validated in `JobService#timeout`); also backs the shutdown
+  force-exit timer above. The upper bound exists so `ecosystem.config.cjs`'s static `kill_timeout`
+  can be derived once and stay valid for every value config validation allows — see "Graceful
+  shutdown".
+- `LEASE_MS` (default 30 000 ms, range 2 000–300 000) / `HEARTBEAT_MS` (default 10 000 ms, `min`
+  250, must be `<LEASE_MS`): the lease a claimed run holds, and how often an in-flight call renews
+  it. Deliberately independent of `MAX_TIMEOUT_MS` — a call can run far longer than `LEASE_MS`
+  without losing its lease, as long as its heartbeat keeps succeeding; see "Lease ownership".
 - The configured `timeoutMs` is passed as Node's `http(s).request({ timeout })` option
   (`src/net/http-caller.js`); on firing it destroys the request with a retryable `CallError` coded
   `TIMEOUT`, which the worker turns into a retry or a failure per the job's retry policy.
@@ -177,7 +209,51 @@ enforces this relationship automatically.
 - **Run claiming** (`RunStore#claim`): idempotent by construction — the claiming `UPDATE` is
   conditioned on `status IN ('pending', 'retrying')` inside one write transaction, so the same run
   row can never be claimed twice, in-process or (see "Scaling model") across processes on the same
-  file.
+  file. Since Stage 6 each claim also gets a fencing token (see "Lease ownership") — the run's
+  *completion* write, not just its claim, is now idempotent under a lost-and-reclaimed lease too: a
+  worker whose lease expired and was reclaimed can no longer overwrite the reclaimed outcome when
+  its own late `finish()` call eventually arrives.
+
+## Lease ownership
+
+Stage 6. Every claimed run gets, in addition to `status = 'running'`:
+- **`owner_token`** — a fresh random value (`randomUUID()`) generated once per `claim()` call, the
+  fencing token. There is no separate generation counter: a fresh random token per claim can never
+  collide with a previous one, so the token alone is the whole fencing mechanism.
+- **`lease_until`** — set to `now + LEASE_MS` at claim time, renewed to `now + LEASE_MS` again every
+  `HEARTBEAT_MS` while the call is in flight (`Worker#execute`'s `setInterval`, cleared in a
+  `finally` once the call settles).
+
+Every write that ends a claimed attempt — `RunStore#finish` and `RunStore#heartbeat` — is guarded
+by `WHERE id = ? AND owner_token = ? AND status = 'running'`. Two consequences:
+- **Heartbeat loss is detected proactively.** If a heartbeat's own guarded `UPDATE` matches zero
+  rows, the worker logs a warning immediately — it knows it has lost the lease before the call even
+  finishes. This is a fast, non-authoritative signal, not the only safety net.
+- **A late-returning owner can never overwrite a reclaimed run.** When the call eventually finishes
+  (success or failure), `RunStore#finish`'s own guarded `UPDATE` is the authoritative check: if
+  another process's reclaim already changed `owner_token` or `status`, this write matches zero rows
+  and is discarded (logged, not thrown) — `test/lease.test.js` and `test/lease-concurrency.test.js`
+  cover this with both same-process and real cross-connection scenarios.
+
+**Reclaiming an expired lease** (`RunStore#reclaimExpired`, called both by `Worker#recover()` at
+startup, labeled `"interrupted by restart"`, and by the in-loop `#reclaimStale()` on every poll
+pass, labeled `"lease expired"`) reads every `status = 'running'` row whose `lease_until` has
+passed (or is `NULL`, for a pre-Stage-6 leftover row) and settles each one as a failed attempt —
+following the normal retry/backoff decision, so it costs an attempt like any other failure. The
+read and every write happen inside ONE transaction (`BEGIN IMMEDIATE`), which is what makes this
+race-free against a concurrent heartbeat for the same row: the heartbeat's renewal either commits
+entirely before the reclaim transaction starts (the row is no longer expired, so it's simply not
+selected) or is attempted entirely after (its own guarded `UPDATE` then matches zero rows, because
+the reclaim transaction already moved the row off `'running'`). There is no window in which both
+could believe they own the same row.
+
+**What changed from before Stage 6**: `recover()` used to settle *every* `status = 'running'` row
+unconditionally, regardless of whether its lease (there was no lease column) had expired — correct
+only because it ran once, at this same process's own startup, so every such row was necessarily
+orphaned by this process's own prior life. Extending that logic to the in-loop sweep, or to a
+second worker process, would have been wrong: it would steal a run a still-live sibling process
+genuinely owns. The lease/fencing model is what makes the *same* reclaim logic safe to run
+periodically and from more than one process — see "Scaling model".
 
 ## Backup
 
@@ -219,8 +295,12 @@ siblings while the process is live can capture a state that is missing recently-
   constructor; it is not persisted and does not reconcile against the `runs` table.
 - `scheduler_attempts_retried_total` — **per-process, resets on restart** (same `worker.counters`
   source as above).
-- `scheduler_in_flight` — live snapshot of `worker.inFlight.size`, inherently instantaneous rather
-  than durable or cumulative.
+- `scheduler_in_flight` — live snapshot of `worker.inFlight.size` when this process has a `Worker`;
+  in the API-only role (no in-process `Worker`), falls back to `runs.runningCount()` (a durable DB
+  query), which also correctly reflects runs claimed by a *different* process. Either way,
+  inherently instantaneous rather than cumulative.
+- `scheduler_worker_up` — Stage 6, `1`/`0`: whether a worker process is currently alive at all (this
+  process's own `Worker`, or another one's `worker_heartbeat` row), for the API-only role.
 - `scheduler_next_due_seconds` — **durable**, derived from `jobs.counts().nextDueAt` (DB query);
   `-1` when nothing is scheduled.
 - `scheduler_process_uptime_seconds` — `process.uptime()`, process-scoped by definition.
@@ -282,44 +362,49 @@ propagation of any kind.
   one-directional — scheduler signs its own outbound calls for receivers to verify; it does not
   itself accept or check a signature on incoming API requests, only the Bearer API key).
 
+## API/worker runtime split
+
+Stage 6 adds two more entry points alongside the default combined one — `src/api-main.js` (HTTP
+only, no `Worker`, never claims a run) and `src/worker-main.js` (`Worker` only, no HTTP listener at
+all, not even for health checks). `Application`'s `role` constructor option (`'combined'` default,
+`'api'`, `'worker'`) picks which parts get built; `Config`, the database, and the migrations are
+identical across all three — nothing about the persistence or environment contract differs by
+role. `ecosystem.config.cjs` ships the split apps commented out, ready to enable in place of the
+combined one.
+
 ## Scaling model
 
-**B — single-node stateful.** `ecosystem.config.cjs` sets `instances: 1` with the comment "one
-process per SQLite file"; the worker loop, job/run claiming, and the single `DatabaseSync`
-connection all live in one process, with no external queue or coordinator.
-
-Whether two instances on the *same* SQLite file would be safe, precisely: **correctness is
-preserved, throughput is not, and crash recovery is not.**
-- *Correctness*: both the job-firing check (`JobService#fire`, which re-reads the job row inside a
-  transaction and compares `next_run_at` before firing) and the run-claiming update
-  (`RunStore#claim`, an `UPDATE ... WHERE status IN ('pending','retrying')` inside one write
-  transaction) are guarded by SQLite's own single-writer serialization in WAL mode (`BEGIN
-  IMMEDIATE` inside `Database#transaction`) plus a conditional re-check of state — so two processes
-  racing to fire the same due job, or claim the same due run, cannot both succeed; one transaction
-  commits and the other's re-check sees the already-advanced state and no-ops.
-- *Throughput*: a second instance provides no additional capacity — both instances poll for and
-  attempt to claim the exact same due jobs/runs, so they compete for SQLite's write lock
-  (`busy_timeout = 5000` ms; a transaction that cannot acquire the lock within that window throws,
-  which the worker's poll loop catches and logs as `'worker iteration failed'`, retrying next
-  `pollMs`) rather than dividing the work.
-- *Crash recovery*: `Worker#recover()` — which finds runs stuck at `status = 'running'` from a
-  killed process and turns them into a retryable failed attempt — runs exactly once, at that
-  process's own `start()`. It is not a periodic sweep and it is not triggered by another process's
-  activity. If instance A is killed mid-call and never restarts, instance B (still running against
-  the same file) will never observe or reap A's stuck `running` row on its own — see "Known failure
-  modes".
+**B — single-node stateful, but "single-node" now means one HOST, not one PROCESS.**
+`ecosystem.config.cjs`'s default (combined) app still pins `instances: 1`, but the commented-out
+split `scheduler-worker` app documents raising its own `instances` above 1 as a supported topology
+— multiple worker processes (and, separately, multiple API processes) against the same `DB_PATH`
+file, all on one host. This is a genuine change from before Stage 6, not just a relaxed warning:
+**correctness, throughput, and crash recovery are now all preserved across processes.**
+- *Correctness*: unchanged in spirit — the job-firing check (`JobService#fire`) and the run-claiming
+  update (`RunStore#claim`) are still guarded by SQLite's own single-writer serialization in WAL
+  mode (`BEGIN IMMEDIATE`) plus a conditional re-check of state, proven with real cross-connection
+  concurrency (not same-process `Promise.all`) in `test/lease-concurrency.test.js`.
+- *Throughput*: **now genuinely improved** by adding worker processes, up to SQLite's own
+  single-writer ceiling — multiple workers claim disjoint batches (the claiming transaction is
+  atomic per batch) and execute their HTTP calls fully in parallel across processes; only the brief
+  claim/finish/heartbeat writes themselves serialize on the file lock, not the calls' own duration.
+- *Crash recovery*: **now genuinely shared.** The in-loop `#reclaimStale()` sweep (not just
+  `recover()` at startup) means any worker process — not only the one that originally claimed a
+  run — can and will reclaim it once its lease expires. Instance A crashing mid-call no longer
+  requires instance A itself to restart before its stuck run is noticed; any live instance B's next
+  poll pass reclaims it. See "Lease ownership".
 
 ## Single-node / multi-node guarantees
 
-Running exactly one instance (the deployed configuration) is fully correct: no double-firing, no
-double-claiming, and a killed-and-restarted process self-heals via `recover()` on its next start
-(PM2's `autorestart: true` makes this automatic). Running more than one instance against the same
-`DB_PATH` today is *not unsafe* in the sense of duplicate job execution — the transactional checks
-above hold across processes, not just within one — but it provides none of the benefits normally
-expected from running multiple instances: no added throughput, increased write contention under
-load, and a crash in one instance is not automatically recovered by the other. There is no
-supported configuration for two instances against two different files that still means "one
-logical scheduler" — that would simply be two independent schedulers with disjoint job sets.
+Running exactly one process (API+worker combined, the default) is fully correct: no double-firing,
+no double-claiming, and a killed-and-restarted process self-heals via `recover()` on its next start
+(PM2's `autorestart: true` makes this automatic). Running several worker processes against the same
+`DB_PATH` (Stage 6's split-deployment topology) is now a supported configuration, not merely a
+tolerated one: it adds real throughput and real shared crash recovery, at the cost of write-lock
+contention under very high claim rates (bounded by `busy_timeout = 5000` ms) — still one host,
+still one SQLite file; there is no network-shared counter store, so splitting across *hosts* still
+means splitting jobs across separate `scheduler` instances with disjoint job sets and separate
+databases, exactly as before.
 
 ## Known failure modes
 
@@ -335,16 +420,26 @@ logical scheduler" — that would simply be two independent schedulers with disj
 - **The process is killed without a graceful shutdown** (`SIGKILL`, OOM kill past
   `max_memory_restart`, a hard container stop): `shutdown()` only ever runs for `SIGTERM`/`SIGINT`;
   a `SIGKILL` bypasses it entirely. Any run that was `status = 'running'` at the moment of death
-  stays `running` — `RunStore#claim` only selects `pending`/`retrying` rows, so a stuck `running`
-  row is invisible to future claiming — and because `runs.hasActive` treats `running` as active,
-  that job's *next* scheduled firing is recorded as `skipped` (its `next_run_at` pointer still
-  advances) on every tick until the stuck run is recovered. Recovery only happens when some
-  process calls `Worker#start()` (i.e. `recover()` runs once, at startup) against that same
-  database file — in the normal single-instance PM2 deployment this self-heals automatically via
-  `autorestart: true`, but there is no periodic sweep independent of a process actually restarting.
-- **Two instances running against one file** (see "Scaling model" for the safety argument): the
-  concrete, currently-true consequence of doing this anyway is wasted duplicate polling effort,
-  intermittent `SQLITE_BUSY`-driven `'worker iteration failed'` log lines under contention, and —
-  per the previous point — a crash in one instance is never reaped by the other, since `recover()`
-  is a startup-time action tied to a specific process's own `start()` call, not a fact about the
-  shared database.
+  stays `running` and its lease keeps counting down — `RunStore#claim` only selects
+  `pending`/`retrying` rows, so a stuck `running` row is invisible to future claiming — and because
+  `runs.hasActive` treats `running` as active, that job's *next* scheduled firing is recorded as
+  `skipped` (its `next_run_at` pointer still advances) until the stuck run is reclaimed. **Since
+  Stage 6, reclaiming no longer requires that same process to restart**: once `lease_until` passes
+  (at most `LEASE_MS` after the kill, since nothing was heartbeating it anymore), the in-loop
+  `#reclaimStale()` sweep in *any* live worker process against the same file — this one restarting,
+  or a sibling process in a multi-worker deployment — reclaims it on its next poll pass. A
+  single-instance PM2 deployment still self-heals via `autorestart: true` either way.
+- **Heartbeat failure while a call is genuinely still in flight** (event loop stall, a slow/busy DB
+  write for the heartbeat `UPDATE` itself): the heartbeat's own guarded write detects the lost lease
+  and logs a warning immediately, but cannot cancel the outbound HTTP call already in progress. If
+  the lease then expires and another process reclaims the run, the original call's eventual
+  `finish()` is rejected by the same `owner_token`/`status` guard (logged, not thrown) — its result
+  (success or failure) is discarded, and the reclaim's own "lease expired" failed-attempt outcome
+  (with its own retry/backoff) is what stands. This means a genuinely successful call whose
+  heartbeat failed can be silently wasted from the target's point of view and retried — see
+  "Idempotency"'s `X-Scheduler-Run` discussion for what a target can do about that.
+- **Multiple worker processes running against one file** (Stage 6, see "Scaling model"): now a
+  supported topology, not a failure mode — listed here only to be explicit that it is no longer one.
+  The remaining, expected cost under high contention is intermittent `SQLITE_BUSY`-driven
+  `'worker iteration failed'` log lines (`busy_timeout = 5000` ms), the same class of contention a
+  single busy instance would also eventually hit.

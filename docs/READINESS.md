@@ -94,7 +94,8 @@ order — see below for what it was and why):
 3. `this.worker?.stop()` — (redundant `running = false`, in case `stopClaiming` alone wasn't
    called) `await`s every in-flight run (`Promise.allSettled(this.inFlight)`) to finish, so a call
    to a job's target is never interrupted mid-flight by shutdown, and its heartbeat interval is
-   cleared as each settles.
+   cleared as each settles. Stage 6.1: this wait is itself now bounded by `options.drainMs`
+   (`config.maxTimeoutMs + 5_000`) — see below.
 4. `this.audit.close()` — stops the flush timer and does one final `flush()` of buffered audit
    events (with its own retry/backoff; see "Retry policy" — this step can itself take up to
    roughly a minute in the worst case if `audit` is unreachable, bounded only by the overall
@@ -110,9 +111,15 @@ test asserts the exact sequence above by wrapping each step and recording call o
 A force-exit timer is armed *before* any of these steps, at `this.config.maxTimeoutMs + 10_000`
 ms — default `60_000 + 10_000 = 70_000` ms (70 s) — and calls `process.exit(1)` if the steps above
 have not finished by then; it is cleared on successful completion. `unhandledRejection` runs the
-same `shutdown()` path; `uncaughtException` exits immediately with no drain at all. There is no
-separate per-step drain timeout for `worker.stop()`'s own wait — this one force-exit timer bounds
-the whole sequence, deliberately: two overlapping timeouts would be harder to reason about than one.
+same `shutdown()` path; `uncaughtException` exits immediately with no drain at all.
+
+**Stage 6.1**: `worker.stop()`'s own wait for in-flight runs is now bounded by its own `drainMs`
+(`config.maxTimeoutMs + 5_000` — default `65_000` ms), strictly less than the `70_000` ms force-exit
+timer above. It races `Promise.allSettled(inFlight)` against a `sleep(drainMs)` cancelled via
+`AbortController`, and on timeout logs `'drain timed out; continuing shutdown with runs still in
+flight'` then falls through to the remaining steps (audit flush, DB close) rather than hanging —
+those get a chance to run even when the drain itself didn't finish, before the outer force-exit
+timer is the final backstop that kills the process regardless.
 
 Compared to PM2: `ecosystem.config.cjs` sets `kill_timeout: 630000` (630 s). Stage 6 also bounded
 `MAX_TIMEOUT_MS` itself (`config.js`, `max: 600_000`) — previously unbounded, which meant an
@@ -120,6 +127,13 @@ operator could configure a job timeout longer than PM2 would ever wait during sh
 defeating the graceful-drain design; now the worst case the force-exit timer can reach is
 `600_000 + 10_000 = 610_000` ms, comfortably under `kill_timeout`'s fixed 630 s ceiling regardless
 of how `MAX_TIMEOUT_MS` is configured within its validated range.
+
+The five numbers that matter for shutdown, and how they relate: worker drain timeout (`drainMs =
+maxTimeoutMs + 5_000`) fires first and lets audit-flush/db-close still run; the outer force-exit
+timer (`maxTimeoutMs + 10_000`) is the hard backstop; `MAX_TIMEOUT_MS` is the external call's own
+timeout (one run's ceiling); `HEARTBEAT_MS` is how often an in-flight run renews its lease;
+`LEASE_MS` is the lease TTL a stalled/crashed worker's claim expires after. PM2's `kill_timeout`
+(630 s) sits above all of them so PM2 never SIGKILLs before the app's own force-exit timer runs.
 
 ## Resource limits
 
@@ -238,7 +252,10 @@ by `WHERE id = ? AND owner_token = ? AND status = 'running'`. Two consequences:
 **Reclaiming an expired lease** (`RunStore#reclaimExpired`, called both by `Worker#recover()` at
 startup, labeled `"interrupted by restart"`, and by the in-loop `#reclaimStale()` on every poll
 pass, labeled `"lease expired"`) reads every `status = 'running'` row whose `lease_until` has
-passed (or is `NULL`, for a pre-Stage-6 leftover row) and settles each one as a failed attempt —
+passed — strictly `lease_until < now`, so `now == lease_until` is NOT yet expired, the same
+invariant used by claim/heartbeat/finish everywhere in this codebase (Stage 6.1 regression test:
+`test/lease.test.js` "RunStore: reclaimExpired exact-boundary invariant") — (or is `NULL`, for a
+pre-Stage-6 leftover row) and settles each one as a failed attempt —
 following the normal retry/backoff decision, so it costs an attempt like any other failure. The
 read and every write happen inside ONE transaction (`BEGIN IMMEDIATE`), which is what makes this
 race-free against a concurrent heartbeat for the same row: the heartbeat's renewal either commits

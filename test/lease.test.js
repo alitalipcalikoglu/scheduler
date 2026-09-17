@@ -106,7 +106,7 @@ test('Worker: a late-returning owner cannot overwrite a run another worker alrea
   const staleToken = /** @type {string} */ (claimed.owner_token);
   clock.advance(6_000); // this worker's lease is now expired; it is still "about to" finish, unaware
   // A second worker reclaims the run (in-loop sweep) as a failed/retrying attempt.
-  const worker2 = new Worker({ service, jobs: service.jobs, runs, presence: new HeartbeatStore(new Database(':memory:')), caller: new HttpCaller({ signer: new Signer(SIGNING), guard: new NetGuard({ allowHttp: true, allowPrivate: true, allowedHosts: [] }), targetKeys: new Map() }), log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, maxBackoffSec: 3600, leaseMs: 5_000, heartbeatMs: 1_000 }, now: clock.now });
+  const worker2 = new Worker({ service, jobs: service.jobs, runs, presence: new HeartbeatStore(new Database(':memory:')), caller: new HttpCaller({ signer: new Signer(SIGNING), guard: new NetGuard({ allowHttp: true, allowPrivate: true, allowedHosts: [] }), targetKeys: new Map() }), log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, maxBackoffSec: 3600, leaseMs: 5_000, heartbeatMs: 1_000, drainMs: 5_000 }, now: clock.now });
   worker2.recover();
   const afterReclaim = runs.get(triggered.id);
   assert.equal(afterReclaim?.status, 'retrying');
@@ -130,7 +130,7 @@ test('Worker: heartbeat keeps a long in-flight call owned across the original le
   const guard = new NetGuard({ allowHttp: true, allowPrivate: true, allowedHosts: [] });
   const service = new JobService({ db, jobs, runs, guard, schedule: new ScheduleRule({ defaultTimezone: 'UTC' }), options: { targetKeys: new Map(), defaultTimeoutMs: 5000, maxTimeoutMs: 10000, maxRetries: 5, maxBackoffSec: 60, maxBodyBytes: 16384 } });
   const caller = new HttpCaller({ signer: new Signer(SIGNING), guard, targetKeys: new Map() });
-  const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 120, heartbeatMs: 40 } });
+  const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 120, heartbeatMs: 40, drainMs: 5_000 } });
   service.create({ name: 'slow', schedule: { cron: '* * * * *' }, target: { url: `${target.url}/x` }, timeoutMs: 2000 }, 'console');
   const run = service.trigger('slow');
   await worker.tick();
@@ -150,12 +150,12 @@ test('Worker: without a heartbeat, a call longer than the lease is reclaimable m
   const service = new JobService({ db, jobs, runs, guard, schedule: new ScheduleRule({ defaultTimezone: 'UTC' }), options: { targetKeys: new Map(), defaultTimeoutMs: 5000, maxTimeoutMs: 10000, maxRetries: 5, maxBackoffSec: 60, maxBodyBytes: 16384 } });
   const caller = new HttpCaller({ signer: new Signer(SIGNING), guard, targetKeys: new Map() });
   // heartbeatMs longer than the whole call: the lease will lapse before any renewal fires.
-  const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 60, heartbeatMs: 10_000 } });
+  const worker = new Worker({ service, jobs, runs, presence, caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 60, heartbeatMs: 10_000, drainMs: 5_000 } });
   service.create({ name: 'slow', schedule: { cron: '* * * * *' }, target: { url: `${target.url}/x` }, timeoutMs: 2000 }, 'console');
   const run = service.trigger('slow');
   const executing = worker.tick(); // fire the claim + call, don't await yet
   await new Promise((resolve) => setTimeout(resolve, 90)); // past the 60ms lease, call still in flight
-  const sweep = new Worker({ service, jobs, runs, presence: new HeartbeatStore(new Database(':memory:')), caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 60, heartbeatMs: 10_000 } });
+  const sweep = new Worker({ service, jobs, runs, presence: new HeartbeatStore(new Database(':memory:')), caller, log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, maxBackoffSec: 60, leaseMs: 60, heartbeatMs: 10_000, drainMs: 5_000 } });
   sweep.recover();
   const mid = runs.get(run.id);
   assert.equal(mid?.status, 'retrying', 'reclaimed while the original call was still outstanding');
@@ -175,6 +175,19 @@ test('Worker: completion arriving exactly at the lease boundary is accepted (bou
   assert.ok(finished, 'finish is guarded by owner_token + status only, never by lease_until — a completion race with a concurrent reclaim at this instant is resolved by whichever transaction commits first, not by an off-by-one on the boundary itself');
 });
 
+test('RunStore: reclaimExpired exact-boundary invariant — now == lease_until is NOT yet expired (Stage 6.1)', () => {
+  const { service, runs, clock } = testService();
+  service.create({ name: 'a', schedule: { cron: '* * * * *' }, target: { url: 'https://api.example/x' } }, 'console', clock.now());
+  service.trigger('a', clock.now());
+  const [run] = runs.claim(clock.now(), 1, 1_000);
+  const leaseUntil = /** @type {number} */ (run.lease_until);
+  const decide = (/** @type {any} */ r) => ({ status: /** @type {const} */ ('failed'), finishedAt: leaseUntil, durationMs: 0, httpStatus: null, response: null, error: 'lease expired', attempts: JSON.parse(r.attempts), nextAttemptAt: null });
+  assert.deepEqual(runs.reclaimExpired(leaseUntil, decide), [], 'now === lease_until: still valid, same invariant as claim/heartbeat/finish');
+  assert.equal(runs.get(run.id)?.status, 'running');
+  const reclaimed = runs.reclaimExpired(leaseUntil + 1, decide);
+  assert.equal(reclaimed.length, 1, 'one ms later: now expired');
+});
+
 test('Worker: stopClaiming() stops new claims but lets in-flight work finish, drained by stop()', async (t) => {
   const target = await targetServer(() => ({ status: 200, delayMs: 150 }));
   t.after(target.close);
@@ -192,4 +205,27 @@ test('Worker: stopClaiming() stops new claims but lets in-flight work finish, dr
   await worker.stop();
   assert.equal(runs.get(runA.id)?.status, 'succeeded', 'work claimed before stopClaiming() still finished');
   assert.equal(runs.get(runB.id)?.status, 'pending', 'still untouched after full stop');
+});
+
+test('Worker: stop() is bounded by drainMs even if an in-flight call never resolves (Stage 6.1)', async () => {
+  const { service, jobs, runs, clock } = testService();
+  service.create({ name: 'a', schedule: { cron: '* * * * *' }, target: { url: 'https://api.example/x' } }, 'console', clock.now());
+  service.trigger('a', clock.now());
+  /** @type {[object, string][]} */
+  const errors = [];
+  const log = /** @type {any} */ ({
+    info() {}, warn() {}, debug() {}, fatal() {}, child() { return this; },
+    error(/** @type {object} */ obj, /** @type {string} */ msg) { errors.push([obj, msg]); },
+  });
+  const stuckCaller = { call: () => new Promise(() => {}) };
+  const worker = new Worker({ service, jobs, runs, presence: new HeartbeatStore(new Database(':memory:')), caller: /** @type {any} */ (stuckCaller), log, options: { concurrency: 1, pollMs: 20, retentionDays: 30, maxBackoffSec: 60, leaseMs: 30_000, heartbeatMs: 1_000, drainMs: 100 }, now: clock.now });
+  worker.start();
+  const deadline = Date.now() + 2_000;
+  while (runs.list({}, { limit: 1 })[0]?.status !== 'running' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  const startedStop = Date.now();
+  await worker.stop();
+  const elapsed = Date.now() - startedStop;
+  assert.ok(elapsed < 1_000, `stop() must not hang forever; took ${elapsed}ms with drainMs=100`);
+  assert.equal(errors.length, 1, 'logs exactly the drain-timeout error');
+  assert.match(errors[0][1], /drain timed out/);
 });

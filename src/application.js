@@ -79,7 +79,10 @@ export class Application {
     let log = new ConsoleLogger({ level: /** @type {any} */ (config.logLevel) });
 
     if (runsWorker) {
-      this.worker = new Worker({ service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, caller: this.caller, log: log.child({ component: 'worker' }), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs } });
+      // Stage 6.1: drainMs bounds the worker's own wait for in-flight calls, strictly less than
+      // forceExitMs below (same call-timeout ceiling, smaller margin) so a stuck drain logs and
+      // lets the remaining shutdown steps at least attempt to run before the process force-exits.
+      this.worker = new Worker({ service: this.service, jobs: this.jobs, runs: this.runs, presence: this.presence, caller: this.caller, log: log.child({ component: 'worker' }), options: { concurrency: config.workerConcurrency, pollMs: config.pollMs, retentionDays: config.runRetentionDays, maxBackoffSec: config.maxBackoffSec, leaseMs: config.leaseMs, heartbeatMs: config.heartbeatMs, drainMs: config.maxTimeoutMs + 5_000 } });
     }
 
     /** @type {(() => (void|Promise<void>))[]} */
@@ -97,9 +100,9 @@ export class Application {
     // drain whatever the worker already had in flight, THEN flush audit, THEN close the DB. Audit
     // used to flush before the worker drained — any event a still-draining run's outcome needed to
     // record could be queued into a buffer that had already been flushed and stopped, and would
-    // then sit unflushed until process exit. `worker.stop()`'s own bounded wait is
-    // `forceExitMs` below (there is no separate per-step drain timeout — one bound, applied to the
-    // whole sequence, is simpler than two overlapping ones and Lifecycle already provides it).
+    // then sit unflushed until process exit. `worker.stop()` now has its own bounded drain wait
+    // (`drainMs` above, Stage 6.1) strictly shorter than `forceExitMs` below, so a stuck drain logs
+    // and moves on to the remaining steps before the whole process gets force-killed.
     if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stopClaiming());
     if (this.app) steps.push(() => this.app?.close());
     if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stop());

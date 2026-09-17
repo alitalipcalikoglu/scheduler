@@ -121,6 +121,38 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+Single-node stateful: one process owns the SQLite file at `DB_PATH` (`instances: 1` in
+`ecosystem.config.cjs`, "one process per SQLite file"), with the worker loop and the database
+connection living in that one process. Two instances against the same file would not double-fire a
+job or double-claim a run — the firing and claiming updates are guarded by SQLite's own write-lock
+serialization plus a conditional re-check of state — but a second instance adds no throughput
+(both poll and contend for the same due rows) and does not improve crash recovery, since a killed
+instance's stuck runs are only reaped by a process's own startup, not observed by a sibling
+process. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Observability
+
+Every request already gets a `reqId` (Fastify's `requestIdHeader: 'x-request-id'`, generated when
+the caller sends none), redacted `Authorization` headers in logs, and structured run-outcome log
+lines from the worker (`job`, `run`, `attempt`, `status`, `httpStatus`, `durationMs`,
+`nextAttemptAt`). `scheduler` does not parse or forward a `traceparent` header — that is
+implemented in `gateway` only so far — and its own outbound calls (to job targets and to `audit`)
+do not propagate `X-Request-Id` or `traceparent` onward. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Backup / restore
+
+The only state that needs to survive a disk loss is the SQLite file at `DB_PATH` (jobs and run
+history), including its `-wal`/`-shm` sidecars while the process is live. There is no backup
+mechanism built into this codebase today; capture it with the `sqlite3` CLI's `.backup` (or
+`VACUUM INTO`) against the live file, or stop the process and copy the file directly. Restoring
+means stopping the process, replacing the file, and starting again — `Database` runs its migration
+check on open, so a slightly older backup catches up automatically. `scheduler`'s tables are
+self-contained; there is no cross-service data-ordering constraint to restoring it. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

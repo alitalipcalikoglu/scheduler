@@ -1,0 +1,1294 @@
+openapi: 3.1.0
+info:
+  title: scheduler
+  version: "1.0.0"
+  description: >-
+    Cron and one-shot job scheduler: signed HTTP calls to your services, retries with backoff,
+    run history, timezone-aware schedules. Part of the atc-web platform; every route under `/v1`
+    requires a Bearer API key with a `read` or `write` role (`readwrite` satisfies either).
+
+    Role checks run in Fastify `preValidation`, which executes *before* the request body is
+    validated against its JSON Schema. A write request sent with a `read`-only (or missing)
+    key therefore always gets `403 FORBIDDEN`, even when the body itself is malformed — the
+    body is never parsed against its schema in that case. Only a request presenting a key with
+    the required role reaches body validation and can receive `400 VALIDATION_FAILED`.
+tags:
+  - name: Jobs
+  - name: Runs
+  - name: Schedule
+  - name: Reference
+  - name: Meta
+  - name: Operational
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: scheduler.health.get
+      summary: Liveness probe
+      description: Always `200` while the process is up. No dependency check.
+      tags: [Meta]
+      security: []
+      x-stack-visibility: public
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /ready:
+    get:
+      operationId: scheduler.ready.get
+      summary: Readiness probe
+      description: >-
+        Runs `db.ping()`, cached for 10 seconds. `worker` reports `"running"`/`"stopped"`: from
+        the in-process `Worker` in the combined role, or derived from the `worker_heartbeat`
+        table (fresh within 4 heartbeat intervals) in the API-only role.
+      tags: [Meta]
+      security: []
+      x-stack-visibility: public
+      responses:
+        "200":
+          description: Ready to serve traffic.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: The database ping failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyUnavailableResponse"
+
+  /v1/info:
+    get:
+      operationId: scheduler.info.get
+      summary: Service and API contract identification
+      description: >-
+        `capabilities` is a static, always-on list for this service (confirmed no
+        config flag makes any of these instance-variable). `schemaVersion` is the database's
+        real `PRAGMA user_version`.
+      tags: [Meta]
+      security: []
+      x-stack-visibility: public
+      responses:
+        "200":
+          description: Instance identification.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InfoResponse"
+
+  /metrics:
+    get:
+      operationId: scheduler.metrics.get
+      summary: Prometheus metrics
+      description: >-
+        Authenticated (any role) but exempt from this service's own `/v1` rate limiter — a fixed,
+        platform-wide convention so scraper traffic on a regular schedule is never throttled.
+        Since-process-start counters (`scheduler_runs_finished_total`,
+        `scheduler_attempts_retried_total`) report real zero, not an omitted metric, from an
+        API-only process that never finished a run itself.
+      tags: [Operational]
+      x-stack-visibility: operational
+      responses:
+        "200":
+          description: Prometheus text-format metrics.
+          content:
+            text/plain; version=0.0.4; charset=utf-8:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/jobs:
+    post:
+      operationId: scheduler.jobs.create
+      summary: Create a job
+      tags: [Jobs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobCreate"
+      responses:
+        "201":
+          description: Job created.
+          headers:
+            location:
+              description: "`/v1/jobs/{name}` of the created job."
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job:
+                    $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/JobExists"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      operationId: scheduler.jobs.list
+      summary: List jobs
+      description: Sorted by name; keyset-paginated on name.
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobsQ"
+        - $ref: "#/components/parameters/JobsTag"
+        - $ref: "#/components/parameters/JobsEnabled"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/JobsCursor"
+      responses:
+        "200":
+          description: Page of jobs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/jobs/{name}:
+    get:
+      operationId: scheduler.jobs.get
+      summary: Get a job
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job:
+                    $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    patch:
+      operationId: scheduler.jobs.patch
+      summary: Partially update a job
+      description: >-
+        Changing `schedule` or setting `enabled: true` on a paused job recomputes the next
+        firing; setting `enabled: false` clears it. At least one property is required.
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobPatch"
+      responses:
+        "200":
+          description: The updated job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job:
+                    $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    delete:
+      operationId: scheduler.jobs.delete
+      summary: Delete a job
+      description: Deletes the job and, by database cascade, all of its runs.
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/jobs/{name}/run:
+    post:
+      operationId: scheduler.jobs.run
+      summary: Trigger a job manually
+      description: >-
+        Queues a new `pending` run immediately, regardless of the job's schedule or `enabled`
+        bit. Refused with `409 RUN_ACTIVE` when the job already has a `pending`, `running` or
+        `retrying` run — only one run may be in flight per job at a time.
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "202":
+          description: Run queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    $ref: "#/components/schemas/Run"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "409":
+          $ref: "#/components/responses/RunActive"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/jobs/{name}/runs:
+    get:
+      operationId: scheduler.jobs.listRuns
+      summary: List a job's runs
+      description: >-
+        Newest first, keyset-paginated by run id. `404 JOB_NOT_FOUND` when the job does not
+        exist (checked before listing). The query schema also accepts a `job` filter (shared
+        with `GET /v1/runs`'s schema), but any value supplied there has no effect: this route
+        always filters by the `{name}` path parameter.
+      tags: [Jobs]
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - $ref: "#/components/parameters/RunsStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/RunsBefore"
+      responses:
+        "200":
+          description: Page of runs for this job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/runs:
+    get:
+      operationId: scheduler.runs.list
+      summary: List runs across all jobs
+      description: Newest first, keyset-paginated by run id.
+      tags: [Runs]
+      parameters:
+        - $ref: "#/components/parameters/RunsJob"
+        - $ref: "#/components/parameters/RunsStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/RunsBefore"
+      responses:
+        "200":
+          description: Page of runs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/runs/{id}:
+    get:
+      operationId: scheduler.runs.get
+      summary: Get a run
+      tags: [Runs]
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: The run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    $ref: "#/components/schemas/Run"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/RunNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/runs/{id}/cancel:
+    post:
+      operationId: scheduler.runs.cancel
+      summary: Cancel a queued or retrying run
+      description: >-
+        Only `pending` and `retrying` runs can be cancelled. A `running` run (an attempt
+        currently in flight) cannot be interrupted through this or any other HTTP route —
+        cancelling it returns `409 RUN_NOT_CANCELLABLE`, as does cancelling a run already in a
+        terminal state (`succeeded`, `failed`, `skipped`, `cancelled`).
+      tags: [Runs]
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: The cancelled run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    $ref: "#/components/schemas/Run"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/RunNotFound"
+        "409":
+          $ref: "#/components/responses/RunNotCancellable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/schedule/preview:
+    get:
+      operationId: scheduler.schedule.preview
+      summary: Preview a cron schedule's upcoming firings
+      description: >-
+        Cron schedules only — there is no equivalent preview for a one-shot (`at`) schedule,
+        since a one-shot schedule has exactly one firing, itself.
+      tags: [Schedule]
+      parameters:
+        - name: cron
+          in: query
+          required: true
+          description: Five-field cron expression (or `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`/`@annually`/`@midnight` alias).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - name: timezone
+          in: query
+          required: false
+          description: IANA timezone name. Defaults to the server's `DEFAULT_TIMEZONE`.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+        - name: count
+          in: query
+          required: false
+          description: Number of upcoming firings to return, 1-50. Defaults to 5.
+          schema:
+            type: string
+            pattern: "^([1-9]|[1-4][0-9]|50)$"
+      responses:
+        "200":
+          description: Normalized cron/timezone and the next firings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewResponse"
+        "400":
+          $ref: "#/components/responses/InvalidSchedule"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/target-keys:
+    get:
+      operationId: scheduler.targetKeys.list
+      summary: List configured target key names
+      description: >-
+        Names only (sorted), from `TARGET_KEYS` — never the secrets themselves. A job references
+        one of these names via `targetKey` to have its outbound call carry that key's bearer
+        token, instead of putting `Authorization` in `target.headers` (which is rejected).
+      tags: [Reference]
+      responses:
+        "200":
+          description: Configured target key names.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TargetKeysResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/timezones:
+    get:
+      operationId: scheduler.timezones.list
+      summary: List supported IANA timezone names
+      description: The full set of `Intl.supportedValuesOf('timeZone')` for this Node runtime.
+      tags: [Reference]
+      responses:
+        "200":
+          description: Supported timezone names.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimezonesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/stats:
+    get:
+      operationId: scheduler.stats.get
+      summary: Job and run statistics
+      description: >-
+        `runs.last24h`/`avgDurationMs24h`/`topFailures24h` cover a fixed trailing 24-hour window.
+        `worker.sinceStart` is `null` from an API-only process (no in-process `Worker` to read
+        since-start counters from); `worker.inFlight` and `worker.running` are always real and
+        durable either way (from the `runs` table / `worker_heartbeat`, not process memory).
+      tags: [Reference]
+      responses:
+        "200":
+          description: Aggregate statistics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <secret>`. Every configured key is compared in constant time; a
+        key carries a role (`read`, `write` or `readwrite`) that gates which routes it may call.
+        Missing or unrecognized key: `401 UNAUTHORIZED` with a `www-authenticate: Bearer` header.
+        Recognized key lacking the required role: `403 FORBIDDEN`.
+
+  parameters:
+    JobName:
+      name: name
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/JobNameValue"
+    RunId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[1-9][0-9]{0,15}$"
+    JobsQ:
+      name: q
+      in: query
+      required: false
+      description: Case-sensitive substring match against name and description.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 120
+    JobsTag:
+      name: tag
+      in: query
+      required: false
+      description: Exact match against one of the job's tags.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 40
+    JobsEnabled:
+      name: enabled
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: ["true", "false"]
+    JobsCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque keyset cursor — the `name` of the last item from the previous page.
+      schema:
+        $ref: "#/components/schemas/JobNameValue"
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size, 1-200. Defaults to 50.
+      schema:
+        type: string
+        pattern: "^([1-9]|[1-9][0-9]|1[0-9][0-9]|200)$"
+    RunsStatus:
+      name: status
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/RunStatus"
+    RunsJob:
+      name: job
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/JobNameValue"
+    RunsBefore:
+      name: before
+      in: query
+      required: false
+      description: Opaque keyset cursor — the `id` of the last item from the previous page.
+      schema:
+        type: string
+        pattern: "^[1-9][0-9]{0,15}$"
+
+  responses:
+    Unauthorized:
+      description: Missing or unrecognized API key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: UNAUTHORIZED, message: "missing or invalid API key" }
+    Forbidden:
+      description: The API key does not have the role required for this route.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: FORBIDDEN, message: "this API key has no write access" }
+    RateLimited:
+      description: This service's own per-key rate limit was exceeded (distinct from any job-level HTTP outcome).
+      headers:
+        retry-after:
+          schema:
+            type: integer
+        x-ratelimit-limit:
+          schema:
+            type: integer
+        x-ratelimit-remaining:
+          schema:
+            type: integer
+        x-ratelimit-reset:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: RATE_LIMITED, message: "rate limit exceeded, retry in 42" }
+    BadRequest:
+      description: >-
+        Either a body/query that fails JSON Schema validation (`VALIDATION_FAILED`) or one that
+        passes schema validation but fails a domain rule — `INVALID_SCHEDULE`, `INVALID_TARGET`
+        or `UNKNOWN_TARGET_KEY`. See each schema's description for exactly which rule produced
+        which code.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            validationFailed:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: "body/schedule must have required property 'cron'"
+                  details: [{ path: "/schedule", message: "must have required property 'cron'", params: {} }]
+            invalidSchedule:
+              value:
+                error: { code: INVALID_SCHEDULE, message: "invalid cron expression: expected 5 fields, got 4" }
+            invalidTarget:
+              value:
+                error: { code: INVALID_TARGET, message: "scheme \"ftp:\" is not allowed" }
+            unknownTargetKey:
+              value:
+                error: { code: UNKNOWN_TARGET_KEY, message: "target key \"billing\" is not configured (TARGET_KEYS)" }
+    InvalidSchedule:
+      description: The `cron` expression or `timezone` is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: INVALID_SCHEDULE, message: "invalid cron expression: expected 5 fields, got 4" }
+    BodyTooLarge:
+      description: "`target.body`, JSON-encoded, exceeds `MAX_BODY_BYTES`."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: BODY_TOO_LARGE, message: "body is 20000 bytes, limit 16384" }
+    JobNotFound:
+      description: No job with this name exists.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: JOB_NOT_FOUND, message: "job \"nightly-export\" not found" }
+    JobExists:
+      description: A job with this name already exists.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: JOB_EXISTS, message: "job \"nightly-export\" already exists" }
+    RunNotFound:
+      description: No run with this id exists.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: RUN_NOT_FOUND, message: "run 42 not found" }
+    RunActive:
+      description: The job already has a queued, running or retrying run; only one run may be in flight per job.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: RUN_ACTIVE, message: "job \"nightly-export\" already has a queued or running run" }
+    RunNotCancellable:
+      description: The run is not `pending` or `retrying` (including a `running` run, which cannot be interrupted).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error: { code: RUN_NOT_CANCELLABLE, message: "run 42 is running; only pending and retrying runs can be cancelled" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code.
+            message:
+              type: string
+            details:
+              description: Present only for `VALIDATION_FAILED` (array of Ajv findings); otherwise absent.
+              type: array
+              items:
+                type: object
+                properties:
+                  path: { type: string }
+                  message: { type: string }
+                  params: { type: object }
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    ReadyResponse:
+      type: object
+      required: [status, worker]
+      properties:
+        status:
+          type: string
+          const: ok
+        worker:
+          type: string
+          enum: [running, stopped]
+
+    ReadyUnavailableResponse:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          const: unavailable
+        error:
+          type: string
+          description: The readiness check's failure message (e.g. the database ping error).
+
+    InfoResponse:
+      type: object
+      required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+      properties:
+        service:
+          type: string
+          const: scheduler
+        version:
+          type: string
+          description: This service's own package semver.
+        apiVersion:
+          type: string
+          const: v1
+        capabilities:
+          type: array
+          items:
+            type: string
+          example: [cron-schedule, one-off-schedule, retry-backoff, http-target]
+        schemaVersion:
+          type: integer
+          description: Database schema version (`PRAGMA user_version`).
+        serviceCore:
+          type: string
+          description: Version of the installed `@atc-web/service-core` package actually running.
+
+    JobNameValue:
+      type: string
+      pattern: "^[a-z0-9]+([.\\-_][a-z0-9]+)*$"
+      maxLength: 80
+
+    RunStatus:
+      type: string
+      description: >-
+        The full run-status lattice for this service (7 values). `pending` -> `running` ->
+        (`retrying` -> `running`)* -> one of `succeeded`/`failed`/`skipped`/`cancelled`.
+        `running` is reached and left only by the worker's internal claim loop, never by any
+        HTTP route. `skipped` is recorded when a scheduled firing lands while the previous run
+        for that job is still active. This enum is confirmed distinct from webhook-out's
+        6-value delivery-status enum (which has no `skipped`).
+      enum: [pending, running, retrying, succeeded, failed, skipped, cancelled]
+
+    Schedule:
+      type: object
+      additionalProperties: false
+      description: >-
+        A job fires either on a cron schedule or once at a fixed instant. Provide **either**
+        `cron` (with an optional `timezone`, defaulting to the server's `DEFAULT_TIMEZONE`) **or**
+        `at` (an ISO 8601 date-time that must be strictly in the future). This JSON Schema does
+        not itself enforce "exactly one of `cron`/`at`" or "at least one of" — both are
+        additionalProperties:false object of optional fields, so an empty object or an object
+        with both `cron` and `at` both pass schema validation. The domain layer enforces the
+        real rule: if `cron` is present (a string) it is used and `at` is ignored, even when
+        both are supplied; only when `cron` is absent is `at` considered; when neither is a
+        string, the request fails with `400 INVALID_SCHEDULE` ("schedule needs either cron
+        (with optional timezone) or at"). So in practice this is "at least one of `cron`/`at`",
+        with `cron` silently taking priority over `at` when both are given — not "exactly one".
+      properties:
+        cron:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Five-field cron expression, or an `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`/`@annually`/`@midnight` alias.
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: IANA timezone name. Only meaningful together with `cron`; defaults to `DEFAULT_TIMEZONE` when omitted.
+        at:
+          type: string
+          minLength: 20
+          maxLength: 40
+          description: >-
+            ISO 8601 date-time (must start `YYYY-MM-DDT` and parse via `Date.parse`), strictly
+            after the current time. Ignored when `cron` is also present.
+
+    Target:
+      type: object
+      additionalProperties: false
+      required: [url]
+      description: >-
+        The HTTP call a job's firing makes. All `INVALID_TARGET` triggers below are domain-layer
+        checks, not expressible in JSON Schema alone (source: `NetGuard#check` and
+        `JobService#target`).
+      properties:
+        url:
+          type: string
+          minLength: 8
+          maxLength: 2048
+          description: >-
+            Must be an absolute URL. Scheme must be `https:` (or `http:` only when the server's
+            `TARGET_ALLOW_HTTP=true`) -> otherwise `INVALID_TARGET` ("scheme ... is not
+            allowed"). Must not embed credentials (`user:pass@host`) -> `INVALID_TARGET`
+            ("url must not contain credentials"). When the server configures
+            `TARGET_ALLOWED_HOSTS`, the hostname must equal or be a subdomain of one of those
+            entries -> `INVALID_TARGET` ("host ... is not in TARGET_ALLOWED_HOSTS"). DNS
+            resolution and private/loopback-address rejection are **not** checked at job
+            create/update time — only later, synchronously, when the worker actually calls the
+            target — so a `201`/`200` here is not a guarantee the target is reachable or public.
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE, get, post, put, patch, delete]
+          description: Defaults to `POST`. Stored upper-cased.
+        headers:
+          type: object
+          maxProperties: 10
+          propertyNames:
+            maxLength: 64
+          additionalProperties:
+            type: string
+            maxLength: 1024
+          description: >-
+            Extra headers on the outbound call. JSON Schema only bounds count/name-length/value-
+            length; the domain layer additionally requires, per header (else `INVALID_TARGET`):
+            the lower-cased name must match `^x-[a-z0-9-]{1,60}$` (custom `X-*` only — this is
+            also where `Authorization` is rejected: use `targetKey` instead, never a header);
+            the name must NOT start with `x-scheduler-` (reserved for this service's own
+            internal use); and the value must be printable ASCII (`\x20`-`\x7e`), <=1024
+            characters. At most 10 headers total.
+        body:
+          description: >-
+            Any JSON value, sent as `application/json`. Rejected with `INVALID_TARGET` when
+            `method` is `GET` or `DELETE` ("requests cannot carry a body"). When present and
+            its JSON-encoded byte length exceeds the server's `MAX_BODY_BYTES`, rejected with
+            `413 BODY_TOO_LARGE` instead.
+
+    RetryPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        max:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Retries after the first attempt (0 = none). Defaults to 3. Bounded server-side by `MAX_RETRIES`; a value above that bound is `INVALID_TARGET`.
+        backoffSec:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: First retry delay in seconds, doubling per retry, capped at `MAX_BACKOFF_SEC`. Defaults to 30. A value above that server bound is `INVALID_TARGET`.
+
+    JobCreate:
+      type: object
+      additionalProperties: false
+      required: [name, schedule, target]
+      properties:
+        name:
+          $ref: "#/components/schemas/JobNameValue"
+        description:
+          type: string
+          maxLength: 500
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 40
+          description: Normalized on save (trimmed, lower-cased, de-duplicated, sorted).
+        enabled:
+          type: boolean
+          description: Defaults to `true`. A disabled job has no `nextRunAt` and never fires on its own.
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+        target:
+          $ref: "#/components/schemas/Target"
+        targetKey:
+          type: [string, "null"]
+          maxLength: 64
+          description: >-
+            Name of a configured `TARGET_KEYS` entry whose bearer token is sent with the
+            outbound call. Must name a configured key, else `400 UNKNOWN_TARGET_KEY`.
+        timeoutMs:
+          type: integer
+          minimum: 1
+          maximum: 3600000
+          description: Defaults to the server's `DEFAULT_TIMEOUT_MS`. Must be between 1000 and the server's `MAX_TIMEOUT_MS`, else `INVALID_TARGET`.
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+
+    JobPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: All fields optional individually, but at least one must be given.
+      properties:
+        description:
+          type: string
+          maxLength: 500
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 40
+        enabled:
+          type: boolean
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+        target:
+          $ref: "#/components/schemas/Target"
+        targetKey:
+          type: [string, "null"]
+          maxLength: 64
+        timeoutMs:
+          type: integer
+          minimum: 1
+          maximum: 3600000
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+
+    Job:
+      type: object
+      required:
+        - name
+        - description
+        - tags
+        - enabled
+        - schedule
+        - target
+        - targetKey
+        - timeoutMs
+        - retry
+        - nextRunAt
+        - lastRunAt
+        - lastStatus
+        - createdBy
+        - createdAt
+        - updatedAt
+      properties:
+        name:
+          $ref: "#/components/schemas/JobNameValue"
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+        target:
+          $ref: "#/components/schemas/Target"
+        targetKey:
+          type: [string, "null"]
+        timeoutMs:
+          type: integer
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+        nextRunAt:
+          type: [string, "null"]
+          format: date-time
+          description: "`null` when the job is disabled or, for an `at` schedule, once it has fired."
+        lastRunAt:
+          type: [string, "null"]
+          format: date-time
+          description: When the job's most recent firing was recorded (`null` before its first firing).
+        lastStatus:
+          type: [string, "null"]
+          enum: [succeeded, failed, skipped, cancelled, null]
+          description: Terminal status of the job's most recent firing. Never `pending`/`running`/`retrying` (those are not "recorded outcomes"). `null` before the job's first firing.
+        createdBy:
+          type: string
+          description: The API key id that created the job.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    JobList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        nextCursor:
+          type: [string, "null"]
+          description: Pass as `cursor` to fetch the next page; `null` on the last page.
+
+    Attempt:
+      type: object
+      required: [n, startedAt, durationMs, httpStatus, error]
+      properties:
+        n:
+          type: integer
+          description: 1-based attempt number.
+        startedAt:
+          type: string
+          format: date-time
+        durationMs:
+          type: integer
+        httpStatus:
+          type: [integer, "null"]
+          description: "`null` when the call itself failed (timeout, DNS, connection error) before a response was received."
+        error:
+          type: [string, "null"]
+
+    Run:
+      type: object
+      required:
+        - id
+        - job
+        - trigger
+        - status
+        - scheduledFor
+        - attempt
+        - maxAttempts
+        - nextAttemptAt
+        - startedAt
+        - finishedAt
+        - durationMs
+        - httpStatus
+        - response
+        - error
+        - attempts
+        - createdAt
+      properties:
+        id:
+          type: integer
+        job:
+          $ref: "#/components/schemas/JobNameValue"
+        trigger:
+          type: string
+          enum: [schedule, manual]
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        scheduledFor:
+          type: string
+          format: date-time
+        attempt:
+          type: integer
+          description: Attempts started so far.
+        maxAttempts:
+          type: integer
+          description: "`retry.max + 1` at the time the run was created."
+        nextAttemptAt:
+          type: [string, "null"]
+          format: date-time
+          description: "Set while `pending`/`retrying`; `null` once `running` or terminal."
+        startedAt:
+          type: [string, "null"]
+          format: date-time
+        finishedAt:
+          type: [string, "null"]
+          format: date-time
+        durationMs:
+          type: [integer, "null"]
+          description: Duration of the last (terminal) attempt.
+        httpStatus:
+          type: [integer, "null"]
+          description: HTTP status of the last attempt.
+        response:
+          type: [string, "null"]
+          description: First bytes of the last attempt's response body.
+        error:
+          type: [string, "null"]
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Attempt"
+        createdAt:
+          type: string
+          format: date-time
+
+    RunList:
+      type: object
+      required: [items, nextBefore]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Run"
+        nextBefore:
+          type: [string, "null"]
+          description: Pass as `before` to fetch the next (older) page; `null` on the last page.
+
+    PreviewResponse:
+      type: object
+      required: [cron, timezone, next]
+      properties:
+        cron:
+          type: string
+          description: The normalized cron expression.
+        timezone:
+          type: string
+          description: The resolved IANA timezone (the request's, or the server default).
+        next:
+          type: array
+          items:
+            type: string
+            format: date-time
+          description: The next upcoming firings, in order.
+
+    TargetKeysResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: string
+          description: Configured `TARGET_KEYS` names, sorted.
+
+    TimezonesResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: string
+          description: IANA timezone names supported by this Node runtime.
+
+    StatsResponse:
+      type: object
+      required: [jobs, runs, worker]
+      properties:
+        jobs:
+          type: object
+          required: [total, enabled, scheduled, nextDueAt]
+          properties:
+            total:
+              type: integer
+            enabled:
+              type: integer
+            scheduled:
+              type: integer
+              description: Enabled jobs that currently have a `nextRunAt`.
+            nextDueAt:
+              type: [string, "null"]
+              format: date-time
+              description: Earliest `nextRunAt` across all enabled, scheduled jobs; `null` when none.
+        runs:
+          type: object
+          required: [byStatus, last24h, avgDurationMs24h, topFailures24h]
+          properties:
+            byStatus:
+              $ref: "#/components/schemas/RunStatusCounts"
+              description: All-time counts by status.
+            last24h:
+              $ref: "#/components/schemas/RunStatusCounts"
+              description: Counts by status for runs created in the trailing 24 hours.
+            avgDurationMs24h:
+              type: [number, "null"]
+              description: Average duration of `succeeded` runs created in the trailing 24 hours; `null` when there were none.
+            topFailures24h:
+              type: array
+              description: Up to 10 jobs with the most `failed` runs in the trailing 24 hours, most first.
+              items:
+                type: object
+                required: [job, failed]
+                properties:
+                  job:
+                    type: string
+                  failed:
+                    type: integer
+        worker:
+          type: object
+          required: [running, inFlight, concurrency, sinceStart]
+          properties:
+            running:
+              type: boolean
+            inFlight:
+              type: integer
+              description: Currently-executing calls. From the in-process `Worker` when there is one, else the durable count of `running` rows in the database.
+            concurrency:
+              type: integer
+              description: Configured `WORKER_CONCURRENCY`.
+            sinceStart:
+              description: >-
+                Process-local counters (`succeeded`/`failed`/`retried`/`skipped`) since this
+                process started. `null` from an API-only process, which has no in-process
+                `Worker` and therefore no such counters — by design, not an omission.
+              oneOf:
+                - type: "null"
+                - type: object
+                  required: [succeeded, failed, retried, skipped]
+                  properties:
+                    succeeded:
+                      type: integer
+                    failed:
+                      type: integer
+                    retried:
+                      type: integer
+                    skipped:
+                      type: integer
+
+    RunStatusCounts:
+      type: object
+      description: One count per status; all 7 keys always present (0 when there are none).
+      required: [pending, running, retrying, succeeded, failed, skipped, cancelled]
+      properties:
+        pending: { type: integer }
+        running: { type: integer }
+        retrying: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        skipped: { type: integer }
+        cancelled: { type: integer }

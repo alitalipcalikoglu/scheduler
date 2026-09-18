@@ -42,8 +42,9 @@ export class SchedulerApi {
    * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
+   * @param {() => number} [deps.now]
    */
-  constructor({ config, audit, service, jobs, runs, presence, worker, db, version, logger }) {
+  constructor({ config, audit, service, jobs, runs, presence, worker, db, version, logger, now = Date.now }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
@@ -54,6 +55,7 @@ export class SchedulerApi {
     this.db = db;
     this.version = version;
     this.logger = logger;
+    this.now = now;
     this.auth = new ApiKeyAuth(config.apiKeys);
   }
 
@@ -172,7 +174,7 @@ export class SchedulerApi {
   }
 
   #stats() {
-    const now = Date.now();
+    const now = this.now();
     const j = this.jobs.counts();
     const r = this.runs.stats(now - SchedulerApi.STATS_WINDOW_MS);
     return {

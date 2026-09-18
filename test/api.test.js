@@ -133,6 +133,31 @@ test('API: manual runs, run listing, cancel, and the worker end to end', async (
   assert.match(metrics.body, /scheduler_jobs\{state="enabled"\} 2\n/);
 });
 
+test('API: stats last24h is windowed by the injected clock, not wall time — inclusive at exactly 24h', async (t) => {
+  const target = await targetServer(() => ({ status: 200, body: '{"done":1}' }));
+  t.after(target.close);
+  const { app, worker, clock } = await buildApp();
+  t.after(() => app.close());
+  await app.inject({ method: 'POST', url: '/v1/jobs', headers: bearer(RW_KEY), payload: { name: 'once', schedule: { cron: '@daily' }, target: { url: `${target.url}/ok` } } });
+  await app.inject({ method: 'POST', url: '/v1/jobs/once/run', headers: bearer(WRITE_KEY) });
+  await worker.tick();
+  const createdAt = clock.now();
+
+  let stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.runs.last24h.succeeded, 1, 'run visible right after it completes');
+
+  // The store's own query is `created_at >= since` (inclusive lower bound) — asserting the real
+  // contract read from `run-store.js`, not a guessed one.
+  clock.advance(24 * 3_600_000 - (clock.now() - createdAt));
+  assert.equal(clock.now() - createdAt, 24 * 3_600_000);
+  stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.runs.last24h.succeeded, 1, 'exactly 24h old: still included (inclusive >= boundary)');
+
+  clock.advance(1);
+  stats = json(await app.inject({ url: '/v1/stats', headers: bearer(READ_KEY) }));
+  assert.equal(stats.runs.last24h.succeeded, 0, '24h + 1ms old: excluded');
+});
+
 test('API: schedule preview, target keys, timezones', async (t) => {
   const { app } = await buildApp();
   t.after(() => app.close());

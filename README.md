@@ -92,6 +92,7 @@ All settings come from environment variables and are validated at startup. See [
 
 ## Security notes
 
+- **At-least-once execution, not exactly-once.** If the target returns `2xx` but this process dies before the run's local `succeeded` state commits, the same run is retried and the target gets the same request again — do not assume the target sees each run only once. `X-Scheduler-Run` is the run row's own id and stays identical across every retry attempt of that run (only `X-Scheduler-Attempt` changes); a target can use it as an idempotency/deduplication key, but nothing in this service verifies a target actually does so. Each separate firing of a job (a new scheduled tick or a manual `POST /v1/jobs/:name/run`) creates a new run with its own new `X-Scheduler-Run` — distinct from a retry of an existing run.
 - API keys compared in constant time; per-key rate limit; read/write roles checked before body validation.
 - Bearer tokens for targets live only in `TARGET_KEYS`; jobs reference them by name and the API never returns them. Job headers may not set `Authorization`.
 - SSRF guard on every call: scheme, host allowlist, credentials in URL, private/special address ranges (IPv4 and IPv6 including mapped and NAT64 forms), pinned address, no redirects, bounded response capture (1 KiB).

@@ -347,7 +347,7 @@ directly by an untrusted client), so it already unconditionally accepts and logs
 — this predates the current architecture review and is not new. It does **not** parse, validate,
 or forward a `traceparent` header; per
 [OBSERVABILITY.md](../../stack/docs/OBSERVABILITY.md), `traceparent` handling is implemented in
-`gateway` only, as of this review's Stage 1. `scheduler`'s own outbound calls — to job targets
+`gateway` and `console` (Stage 10). `scheduler`'s own outbound calls — to job targets
 (`src/net/http-caller.js`) and to `audit` (`src/net/audit-client.js`) — send neither
 `X-Request-Id` nor `traceparent` onward; the outbound headers to a job target are exactly
 `X-Scheduler-Job`, `X-Scheduler-Run`, `X-Scheduler-Attempt`, `X-Scheduler-Timestamp`,

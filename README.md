@@ -154,9 +154,10 @@ run as a failed attempt — following the same retry/backoff policy as an ordina
 if it later finishes the call it no longer owns, cannot overwrite that outcome: its write is
 rejected (`owner_token`/`status` no longer match), not silently accepted.
 
-This makes **multiple worker processes against the same `DB_PATH` a supported topology**, not just
-one that happens not to corrupt data: `ecosystem.config.cjs`'s split `scheduler-worker` app can run
-with `instances` > 1. Claiming is atomic across processes (`BEGIN IMMEDIATE` around the whole
+Scaling class **B — single-node stateful**, but since Stage 6 "single-node" means one HOST, not
+one PROCESS: **multiple worker processes against the same `DB_PATH` are a supported topology**, not
+just a configuration that happens not to corrupt data: `ecosystem.config.cjs`'s split
+`scheduler-worker` app can run with `instances` > 1. Claiming is atomic across processes (`BEGIN IMMEDIATE` around the whole
 read-decide-write), proven with real cross-connection concurrency in
 `test/lease-concurrency.test.js`, not just same-process `Promise.all`. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract, including exactly what a Redis-style
@@ -169,7 +170,7 @@ Every request already gets a `reqId` (Fastify's `requestIdHeader: 'x-request-id'
 the caller sends none), redacted `Authorization` headers in logs, and structured run-outcome log
 lines from the worker (`job`, `run`, `attempt`, `status`, `httpStatus`, `durationMs`,
 `nextAttemptAt`). `scheduler` does not parse or forward a `traceparent` header — that is
-implemented in `gateway` only so far — and its own outbound calls (to job targets and to `audit`)
+implemented in `gateway` and `console` — and its own outbound calls (to job targets and to `audit`)
 do not propagate `X-Request-Id` or `traceparent` onward. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
 

@@ -170,9 +170,12 @@ every guarantee this design needs; the topology limit is one host, not one proce
 Every request already gets a `reqId` (Fastify's `requestIdHeader: 'x-request-id'`, generated when
 the caller sends none), redacted `Authorization` headers in logs, and structured run-outcome log
 lines from the worker (`job`, `run`, `attempt`, `status`, `httpStatus`, `durationMs`,
-`nextAttemptAt`). `scheduler` does not parse or forward a `traceparent` header — that is
-implemented in `gateway` and `console` — and its own outbound calls (to job targets and to `audit`)
-do not propagate `X-Request-Id` or `traceparent` onward. See
+`nextAttemptAt`). `scheduler` also parses an inbound `traceparent`, trusted only when
+`TRUST_PROXY=true` — the caller's trace-id is continued with a fresh span-id, both logged as
+`traceId`/`spanId` via `@atc-web/service-core`'s `registerRequestContext`. Its own outbound calls
+(to job targets and to `audit`) remain external/operator-configured and do not propagate
+`X-Request-Id` or `traceparent` onward — see [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md).
+See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## Backup / restore

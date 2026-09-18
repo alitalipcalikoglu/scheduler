@@ -30,6 +30,10 @@ test('Worker: successful call carries signature, run headers, bearer token and b
   assert.equal(req.headers['x-scheduler-job'], 'sync');
   assert.equal(req.headers['x-scheduler-run'], String(run.id));
   assert.equal(req.headers['x-scheduler-attempt'], '1');
+  // Post-production Phase 5 security regression: a job target is operator-configured external —
+  // never receives platform trace/request-id headers.
+  assert.equal('traceparent' in req.headers, false);
+  assert.equal('x-request-id' in req.headers, false);
   assert.ok(new Signer(SIGNING).verify(req.body, String(req.headers['x-scheduler-signature']), { now: clock.now() }), 'signature verifies against the raw body');
   assert.deepEqual(worker.counters, { succeeded: 1, failed: 0, retried: 0, skipped: 0 });
 });

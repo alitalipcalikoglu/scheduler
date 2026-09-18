@@ -344,11 +344,14 @@ requests, under its own field name).
 `scheduler` sits behind the gateway/console/peer-service trust boundary (it is never reached
 directly by an untrusted client), so it already unconditionally accepts and logs whatever
 `X-Request-Id` a caller sends via `requestIdHeader: 'x-request-id'` in `src/http/scheduler-api.js`
-— this predates the current architecture review and is not new. It does **not** parse, validate,
-or forward a `traceparent` header; per
-[OBSERVABILITY.md](../../stack/docs/OBSERVABILITY.md), `traceparent` handling is implemented in
-`gateway` and `console` (Stage 10). `scheduler`'s own outbound calls — to job targets
-(`src/net/http-caller.js`) and to `audit` (`src/net/audit-client.js`) — send neither
+— this predates the current architecture review and is not new. It also parses an inbound
+`traceparent` via `@atc-web/service-core`'s `registerRequestContext`, trust-gated on `TRUST_PROXY`
+(same boundary as `X-Forwarded-*`): trusted, the caller's trace-id is continued with a fresh
+span-id; untrusted or malformed, a fresh trace is started. Both `traceId`/`spanId` are logged on
+every request line — see [OBSERVABILITY.md](../../stack/docs/OBSERVABILITY.md). `scheduler`'s own
+outbound calls — to job targets (external, operator-configured — `src/net/http-caller.js`) and to
+`audit` (`src/net/audit-client.js`, deliberately unwired — see OBSERVABILITY.md's trust model) —
+still send neither
 `X-Request-Id` nor `traceparent` onward; the outbound headers to a job target are exactly
 `X-Scheduler-Job`, `X-Scheduler-Run`, `X-Scheduler-Attempt`, `X-Scheduler-Timestamp`,
 `X-Scheduler-Signature`, plus the job's own custom `X-*` headers, `accept`, `user-agent`, and,

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, jsonParser, registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
+import { createErrorHandler, jsonParser, registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { SchedulerError } from '../domain/errors.js';
 import { RunStore } from '../store/run-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
@@ -90,6 +90,7 @@ export class SchedulerApi {
       reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: SchedulerApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
+    registerOpenApi(app, new URL('../../openapi.yaml', import.meta.url));
     registerInfo(app, {
       service: 'scheduler',
       version: this.version,

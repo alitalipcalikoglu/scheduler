@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { READ_KEY, RW_KEY, VERSION, WRITE_KEY, bearer, buildApp, targetServer } from './helpers.js';
 
@@ -10,6 +11,9 @@ test('API: probes, auth and roles', async (t) => {
   assert.equal((await app.inject({ url: '/health' })).statusCode, 200);
   const ready = await app.inject({ url: '/ready' });
   assert.equal(ready.statusCode, 200);
+  const spec = await app.inject({ url: '/openapi.yaml' });
+  assert.equal(spec.body, readFileSync(new URL('../openapi.yaml', import.meta.url), 'utf8'));
+  assert.match(String(spec.headers['content-type']), /^text\/yaml/);
   assert.equal(json(ready).worker, 'stopped');
   assert.equal((await app.inject({ url: '/v1/jobs' })).statusCode, 401);
   assert.equal((await app.inject({ url: '/v1/jobs', headers: bearer('nope'.repeat(10)) })).statusCode, 401);

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: scheduler
-  version: "1.0.0"
+  version: "1.1.0"
   description: >-
     Cron and one-shot job scheduler: signed HTTP calls to your services, retries with backoff,
     run history, timezone-aware schedules. Part of the atc-web platform; every route under `/v1`

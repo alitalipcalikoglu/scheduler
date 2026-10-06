@@ -31,6 +31,17 @@ export class SchedulerApi {
   static PRESENCE_STALE_FACTOR = 4;
 
   /**
+   * Audit meta for a job patch. Target headers and body may hold credentials, so only header
+   * names are kept and the body is dropped.
+   * @param {Record<string, any>} patch
+   */
+  static auditPatch(patch) {
+    if (!patch?.target) return patch;
+    const { url, method, headers } = patch.target;
+    return { ...patch, target: { url, method, headers: Object.keys(headers ?? {}) } };
+  }
+
+  /**
    * @param {object} deps
    * @param {Config} deps.config
    * @param {import('../domain/job-service.js').JobService} deps.service
@@ -135,7 +146,7 @@ export class SchedulerApi {
 
     api.get('/jobs/:name', { ...read, schema: { params: Schemas.nameParams } }, async (request) => ({ job: Views.job(s.get(name(request))) }));
 
-    api.patch('/jobs/:name', { config: { audit: AuditClient.route('scheduler.job.update', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name }), (r) => ({ patch: r.body })) }, ...write, schema: { params: Schemas.nameParams, body: Schemas.patch } }, async (request) => ({ job: Views.job(s.update(name(request), /** @type {any} */ (request.body))) }));
+    api.patch('/jobs/:name', { config: { audit: AuditClient.route('scheduler.job.update', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name }), (r) => ({ patch: SchedulerApi.auditPatch(/** @type {any} */ (r.body)) })) }, ...write, schema: { params: Schemas.nameParams, body: Schemas.patch } }, async (request) => ({ job: Views.job(s.update(name(request), /** @type {any} */ (request.body))) }));
 
     api.delete('/jobs/:name', { config: { audit: AuditClient.route('scheduler.job.delete', (r) => ({ type: 'job', id: /** @type {any} */ (r.params).name })) }, ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => {
       s.remove(name(request));

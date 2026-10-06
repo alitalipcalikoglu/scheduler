@@ -189,3 +189,10 @@ test('API: /v1/info', async (t) => {
   assert.equal(typeof body.schemaVersion, 'number');
   assert.equal(typeof body.serviceCore, 'string');
 });
+
+test('job.update audit meta keeps header names only and drops the target body', async () => {
+  const { SchedulerApi } = await import('../src/http/scheduler-api.js');
+  const meta = SchedulerApi.auditPatch({ enabled: false, target: { url: 'https://x.test/hook', method: 'POST', headers: { authorization: 'Bearer sekret' }, body: { token: 'sekret' } } });
+  assert.deepEqual(meta, { enabled: false, target: { url: 'https://x.test/hook', method: 'POST', headers: ['authorization'] } });
+  assert.deepEqual(SchedulerApi.auditPatch({ enabled: true }), { enabled: true });
+});
